@@ -21,6 +21,7 @@ It is:
 - **Build-aware**: understands Gradle projects, runs `assembleDebug`, parses build failures, and returns agent-friendly diagnostics.
 - **Agent-first**: exposes a compact MCP tool surface that works well inside Claude Code, Codex, Cursor, and similar environments.
 - **UI-capable**: captures accessibility snapshots, references elements as `@e1`, `@e2`, and so on, and can perform actions like `tap`, `fill`, `scroll`, and `back`.
+- **Selector-aware**: lets agents target elements by `resourceId`, `text`, `contentDesc`, `hint`, and state flags instead of depending only on snapshot refs.
 - **Local-dev focused**: optimized for the "I changed code, now prove the Android app still works" loop.
 
 ---
@@ -34,9 +35,12 @@ DroidPilot already supports the main local Android feedback loop:
 - build / install / launch
 - accessibility snapshots
 - basic UI interaction
+- selector-based waits and assertions
+- snapshot diffing between consecutive states
 - screenshot capture
-- log collection
-- app health checks
+- session-aware log collection
+- app health checks with crash baselines
+- environment diagnostics
 
 
 Current scope:
@@ -50,7 +54,6 @@ Known limitations:
 - one active session per server instance
 - UI quality depends on the app exposing useful accessibility metadata
 - no HTTP transport yet
-- no assertion or snapshot diff tools yet
 
 ---
 
@@ -63,10 +66,12 @@ With DroidPilot, an agent can:
 3. run a Gradle build
 4. install and launch the app
 5. inspect the current UI in a compact form
-6. tap buttons, fill fields, scroll lists, and navigate back
-7. capture screenshots
-8. collect logs and runtime health information
-9. iterate on code changes using the same local Android loop
+6. wait for elements and assert visible text or screen state
+7. tap buttons and fill fields by ref, selector, or Compose test tag
+8. diff two consecutive snapshots after a navigation
+9. scroll lists, navigate back, and capture screenshots
+10. collect session-aware logs and runtime health information
+11. iterate on code changes using the same local Android loop
 
 ---
 
@@ -291,6 +296,25 @@ Arguments:
 - `deviceSerial?: string`
 - `preferEmulator?: boolean`
 
+### `doctor`
+
+Validates the local DroidPilot environment and optionally probes a real device snapshot.
+
+Arguments:
+
+- `projectDir?: string`
+- `deviceSerial?: string`
+- `preferEmulator?: boolean`
+- `checkSnapshot?: boolean`
+
+Returns:
+
+- resolved `adb` path
+- connected devices
+- selected device or selection error
+- optional project detection report
+- optional lightweight snapshot probe
+
 ### `close`
 
 Closes the current session and stops the app when possible.
@@ -345,22 +369,98 @@ Returns:
 - element count
 - simplified element list
 
-### `tap`
+Selectors supported across wait/assert/action tools:
 
-Taps an element from the latest snapshot.
+- `ref`
+- `resourceId` / `resourceIdContains`
+- `testTag` / `testTagContains`
+- `text` / `textContains`
+- `contentDesc` / `contentDescContains`
+- `hint` / `hintContains`
+- `type`
+- boolean flags such as `clickable`, `editable`, `enabled`, `selected`, `checked`
+
+Compose note:
+
+- `testTag` works best when the app exposes Compose semantics through `testTagsAsResourceId`
+- DroidPilot normalizes the underlying `resource-id` into a friendly `testTag` field when possible
+
+### `wait_for_element`
+
+Polls the current UI until an element matching a selector appears or the timeout is reached.
 
 Arguments:
 
-- `ref: string`
+- any selector field listed above
+- `timeoutMs?: number`
+- `intervalMs?: number`
+- `interactiveOnly?: boolean`
+
+### `assert_visible`
+
+Asserts that at least one element matching a selector exists in the current UI.
+
+Arguments:
+
+- any selector field listed above
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+
+### `assert_text`
+
+Asserts that a matched element exposes the expected `text`, `contentDesc`, or `hint`.
+
+Arguments:
+
+- any selector field listed above
+- `expected: string`
+- `source?: "text" | "contentDesc" | "hint"`
+- `match?: "equals" | "contains"`
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+
+### `assert_screen`
+
+Asserts the current screen/activity or package name after a navigation or launch.
+
+Arguments:
+
+- `screen?: string`
+- `screenContains?: string`
+- `package?: string`
+- `packageContains?: string`
+- `refresh?: boolean`
+
+### `snapshot_diff`
+
+Compares two consecutive snapshots so an agent can verify what changed after a tap, scroll, or back action.
+
+Arguments:
+
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+- `maxItems?: number`
+
+### `tap`
+
+Taps an element from the latest snapshot or resolves the first match from a semantic selector.
+
+Arguments:
+
+- any selector field listed above
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
 
 ### `fill`
 
-Focuses a text field, clears it, and types new text.
+Focuses a text field, clears it, and types new text. Can target by ref or semantic selector.
 
 Arguments:
 
-- `ref: string`
+- any selector field listed above
 - `text: string`
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
 
 ### `scroll`
 
@@ -369,6 +469,11 @@ Scrolls the active screen.
 Arguments:
 
 - `direction: "up" | "down" | "left" | "right"`
+
+Direction note:
+
+- the value describes the content direction you want to reach
+- for example, `down` means "show lower content in the list"
 
 ### `back`
 
@@ -384,11 +489,12 @@ Arguments:
 
 ### `logs`
 
-Returns recent app logs, filtered by app PID when possible.
+Returns recent app logs using a session or launch baseline, filtered by the current or last known app PID when possible.
 
 Arguments:
 
 - `maxLines?: number`
+- `scope?: "session" | "launch"`
 
 ### `health`
 
@@ -397,7 +503,8 @@ Returns app runtime signals:
 - whether the app is running
 - PID
 - memory usage
-- recent crash indicators from logs
+- crash indicators since this session
+- crash indicators since the latest launch when available
 
 ---
 
@@ -463,6 +570,38 @@ Returns app runtime signals:
 }
 ```
 
+### `wait_for_element`
+
+```json
+{
+  "status": "ok",
+  "queryDescription": "textContains=\"Profile\", clickable=true",
+  "waitedMs": 412,
+  "screen": "com.example.myapp/.MainActivity",
+  "package": "com.example.myapp",
+  "matchCount": 1,
+  "firstMatch": {
+    "ref": "@e8",
+    "type": "NavigationBarItemView",
+    "text": "Profile",
+    "description": "@e8 NavigationBarItemView text=\"Profile\""
+  }
+}
+```
+
+### `snapshot_diff`
+
+```json
+{
+  "status": "changed",
+  "screenChanged": true,
+  "addedCount": 2,
+  "removedCount": 1,
+  "changedCount": 1,
+  "summary": "screen changed from com.example.myapp/.HomeActivity to com.example.myapp/.ProfileActivity; 2 element(s) added; 1 element(s) removed; 1 element(s) changed"
+}
+```
+
 ---
 
 ## Example Agent Prompts
@@ -517,6 +656,9 @@ DroidPilot is designed to be resilient in the places that matter most during loc
 - supports `gradlew.bat` on Windows
 - parses common build failure patterns into structured diagnostics
 - uses a real XML parser for UI snapshots
+- supports semantic selectors for waits, assertions, and UI actions
+- supports explicit Compose `testTag` selectors when they are exposed through accessibility / resource IDs
+- tracks log/crash baselines per session and per launch
 - attempts to resolve the launchable activity instead of assuming `.MainActivity`
 
 That said, DroidPilot still depends on the realities of Android automation:
@@ -618,13 +760,18 @@ src/
   engines/
     adb.ts              Device discovery, UI inspection, interaction, logs
     gradle.ts           Project detection, build execution, APK discovery
+    selectors.ts        Semantic selector matching for waits, assertions, and actions
+    snapshot-diff.ts    UI diffing between consecutive snapshots
     session.ts          Active session state
 
 build/
   Compiled JavaScript output
 
 test/
+  adb-utils.test.mjs    Log parsing and Compose test tag helper tests
   gradle.test.mjs       Build engine smoke and regression tests
+  selectors.test.mjs    Selector matching regression tests
+  snapshot-diff.test.mjs Snapshot diff regression tests
 ```
 
 ### Suggested local validation
@@ -641,6 +788,7 @@ When working on DroidPilot itself, a useful validation sequence is:
 5. then test a real Android app with:
    - `run`
    - `snapshot`
+   - `snapshot_diff`
    - `tap`
    - `health`
    - `logs`
@@ -649,10 +797,8 @@ When working on DroidPilot itself, a useful validation sequence is:
 
 ## Roadmap
 
-- snapshot diffing
-- assertion tools
 - flow recording and replay
-- better selectors for Compose-heavy apps
+- richer Compose semantics and selector support beyond `testTagsAsResourceId`
 - HTTP transport / daemon mode
 - CI integration
 - richer artifact capture

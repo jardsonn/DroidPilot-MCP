@@ -21,6 +21,7 @@ Ele é:
 - **Build-aware**: entende projetos Gradle, roda `assembleDebug`, interpreta falhas de build e devolve diagnósticos úteis para agentes.
 - **Agent-first**: expõe uma superfície MCP enxuta e amigável para Claude Code, Codex, Cursor e ambientes semelhantes.
 - **Capaz de operar UI**: captura snapshots de acessibilidade, referencia elementos como `@e1`, `@e2` e consegue executar ações como `tap`, `fill`, `scroll` e `back`.
+- **Consciente de seletores**: deixa o agente localizar elementos por `resourceId`, `text`, `contentDesc`, `hint` e flags de estado, sem depender só de refs temporários.
 - **Focado em dev local**: otimizado para o fluxo "mudei o código, agora prove que o app Android ainda funciona".
 
 ---
@@ -34,9 +35,12 @@ O DroidPilot já cobre o loop principal de feedback local para agentes Android:
 - build / install / launch
 - snapshots de acessibilidade
 - interações básicas de UI
+- waits e assertions por seletor
+- diff entre snapshots consecutivos
 - captura de screenshot
-- coleta de logs
-- health checks do app
+- coleta de logs consciente de sessão
+- health checks do app com baseline de crash
+- diagnósticos de ambiente
 
 
 Escopo atual:
@@ -50,7 +54,6 @@ Limitações conhecidas:
 - uma sessão ativa por instância do servidor
 - a qualidade da automação depende da qualidade da árvore de acessibilidade do app
 - ainda não há transporte HTTP
-- ainda não há tools de assertion nem diff de snapshots
 
 ---
 
@@ -63,10 +66,12 @@ Com o DroidPilot, um agente pode:
 3. rodar build com Gradle
 4. instalar e abrir o app
 5. inspecionar a UI atual em formato compacto
-6. tocar botões, preencher campos, rolar listas e voltar
-7. capturar screenshots
-8. coletar logs e sinais de saúde do app
-9. iterar sobre mudanças de código usando o mesmo loop local Android
+6. esperar elementos e validar texto, visibilidade ou screen/activity
+7. tocar botões e preencher campos por ref, seletor ou Compose test tag
+8. comparar dois snapshots consecutivos depois de uma navegação
+9. rolar listas, voltar e capturar screenshots
+10. coletar logs e sinais de saúde do app com baseline de sessão
+11. iterar sobre mudanças de código usando o mesmo loop local Android
 
 ---
 
@@ -291,6 +296,25 @@ Argumentos:
 - `deviceSerial?: string`
 - `preferEmulator?: boolean`
 
+### `doctor`
+
+Valida o ambiente local do DroidPilot e opcionalmente faz uma prova rápida de snapshot em um device real.
+
+Argumentos:
+
+- `projectDir?: string`
+- `deviceSerial?: string`
+- `preferEmulator?: boolean`
+- `checkSnapshot?: boolean`
+
+Retorna:
+
+- caminho resolvido do `adb`
+- devices conectados
+- device selecionado ou erro de seleção
+- relatório opcional de detecção do projeto
+- prova opcional de snapshot leve
+
 ### `close`
 
 Encerra a sessão atual e tenta parar o app quando possível.
@@ -345,22 +369,98 @@ Retorna:
 - número de elementos
 - lista simplificada de elementos
 
-### `tap`
+Seletores suportados nas tools de wait/assert/action:
 
-Toca em um elemento do último snapshot.
+- `ref`
+- `resourceId` / `resourceIdContains`
+- `testTag` / `testTagContains`
+- `text` / `textContains`
+- `contentDesc` / `contentDescContains`
+- `hint` / `hintContains`
+- `type`
+- flags booleanas como `clickable`, `editable`, `enabled`, `selected`, `checked`
+
+Nota sobre Compose:
+
+- `testTag` funciona melhor quando o app expõe semântica Compose com `testTagsAsResourceId`
+- o DroidPilot normaliza o `resource-id` subjacente para um campo `testTag` amigável quando possível
+
+### `wait_for_element`
+
+Fica consultando a UI atual até aparecer um elemento compatível com o seletor ou o timeout ser atingido.
 
 Argumentos:
 
-- `ref: string`
+- qualquer campo de seletor listado acima
+- `timeoutMs?: number`
+- `intervalMs?: number`
+- `interactiveOnly?: boolean`
+
+### `assert_visible`
+
+Valida que pelo menos um elemento compatível com o seletor existe na UI atual.
+
+Argumentos:
+
+- qualquer campo de seletor listado acima
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+
+### `assert_text`
+
+Valida que um elemento encontrado expõe o `text`, `contentDesc` ou `hint` esperado.
+
+Argumentos:
+
+- qualquer campo de seletor listado acima
+- `expected: string`
+- `source?: "text" | "contentDesc" | "hint"`
+- `match?: "equals" | "contains"`
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+
+### `assert_screen`
+
+Valida a screen/activity ou o package atual depois de uma navegação ou launch.
+
+Argumentos:
+
+- `screen?: string`
+- `screenContains?: string`
+- `package?: string`
+- `packageContains?: string`
+- `refresh?: boolean`
+
+### `snapshot_diff`
+
+Compara dois snapshots consecutivos para o agente entender o que mudou depois de um `tap`, `scroll` ou `back`.
+
+Argumentos:
+
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
+- `maxItems?: number`
+
+### `tap`
+
+Toca em um elemento do último snapshot ou resolve o primeiro match a partir de um seletor semântico.
+
+Argumentos:
+
+- qualquer campo de seletor listado acima
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
 
 ### `fill`
 
-Foca um campo de texto, limpa o valor atual e digita um novo texto.
+Foca um campo de texto, limpa o valor atual e digita um novo texto. Pode usar ref ou seletor semântico.
 
 Argumentos:
 
-- `ref: string`
+- qualquer campo de seletor listado acima
 - `text: string`
+- `refresh?: boolean`
+- `interactiveOnly?: boolean`
 
 ### `scroll`
 
@@ -369,6 +469,11 @@ Rola a tela ativa.
 Argumentos:
 
 - `direction: "up" | "down" | "left" | "right"`
+
+Nota sobre direção:
+
+- o valor representa a direção do conteúdo que você quer alcançar
+- por exemplo, `down` significa "mostrar conteúdo mais abaixo na lista"
 
 ### `back`
 
@@ -384,11 +489,12 @@ Argumentos:
 
 ### `logs`
 
-Retorna logs recentes do app, filtrados pelo PID quando possível.
+Retorna logs recentes do app usando baseline de sessão ou de launch, filtrados pelo PID atual ou pelo último PID conhecido quando possível.
 
 Argumentos:
 
 - `maxLines?: number`
+- `scope?: "session" | "launch"`
 
 ### `health`
 
@@ -397,7 +503,8 @@ Retorna sinais de runtime do app:
 - se o app está rodando
 - PID
 - uso de memória
-- indicadores recentes de crash nos logs
+- indicadores de crash desde esta sessão
+- indicadores de crash desde o último launch quando disponível
 
 ---
 
@@ -463,6 +570,38 @@ Retorna sinais de runtime do app:
 }
 ```
 
+### `wait_for_element`
+
+```json
+{
+  "status": "ok",
+  "queryDescription": "textContains=\"Perfil\", clickable=true",
+  "waitedMs": 412,
+  "screen": "com.example.meuapp/.MainActivity",
+  "package": "com.example.meuapp",
+  "matchCount": 1,
+  "firstMatch": {
+    "ref": "@e8",
+    "type": "NavigationBarItemView",
+    "text": "Perfil",
+    "description": "@e8 NavigationBarItemView text=\"Perfil\""
+  }
+}
+```
+
+### `snapshot_diff`
+
+```json
+{
+  "status": "changed",
+  "screenChanged": true,
+  "addedCount": 2,
+  "removedCount": 1,
+  "changedCount": 1,
+  "summary": "screen changed from com.example.meuapp/.HomeActivity to com.example.meuapp/.ProfileActivity; 2 element(s) added; 1 element(s) removed; 1 element(s) changed"
+}
+```
+
 ---
 
 ## Exemplos de prompts para agentes
@@ -517,6 +656,9 @@ O DroidPilot foi desenhado para ser resiliente nos pontos mais importantes do de
 - suporta `gradlew.bat` no Windows
 - interpreta padrões comuns de falha de build e devolve diagnósticos estruturados
 - usa parser XML real para snapshots de UI
+- suporta seletores semânticos para waits, assertions e ações de UI
+- suporta seletores explícitos de Compose `testTag` quando eles são expostos via acessibilidade / resource IDs
+- acompanha baseline de logs/crashes por sessão e por launch
 - tenta resolver a launchable activity em vez de assumir `.MainActivity`
 
 Ainda assim, o DroidPilot continua dependente das limitações naturais da automação Android:
@@ -618,13 +760,18 @@ src/
   engines/
     adb.ts              descoberta de device, inspeção de UI, interação e logs
     gradle.ts           detecção de projeto, build e descoberta de APK
+    selectors.ts        matching semântico de seletores para waits, assertions e ações
+    snapshot-diff.ts    diff de UI entre snapshots consecutivos
     session.ts          estado da sessão ativa
 
 build/
   saída JavaScript compilada
 
 test/
+  adb-utils.test.mjs    testes do parser de logs e helper de Compose test tag
   gradle.test.mjs       testes de regressão do build engine
+  selectors.test.mjs    testes de regressão dos seletores
+  snapshot-diff.test.mjs testes de regressão do diff de snapshots
 ```
 
 ### Sequência sugerida de validação local
@@ -641,6 +788,7 @@ Ao trabalhar no DroidPilot em si, uma boa sequência de validação é:
 5. depois validar um app Android real com:
    - `run`
    - `snapshot`
+   - `snapshot_diff`
    - `tap`
    - `health`
    - `logs`
@@ -649,10 +797,8 @@ Ao trabalhar no DroidPilot em si, uma boa sequência de validação é:
 
 ## Roadmap
 
-- diff de snapshots
-- tools de assertion
 - gravação e replay de fluxos
-- seletores melhores para apps muito baseados em Compose
+- suporte mais rico a semântica Compose além de `testTagsAsResourceId`
 - transporte HTTP / daemon mode
 - integração com CI
 - captura de artefatos mais rica

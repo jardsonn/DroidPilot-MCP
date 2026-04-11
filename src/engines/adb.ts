@@ -60,6 +60,7 @@ export interface UIElement {
   hint?: string;
   contentDesc?: string;
   resourceId?: string;
+  testTag?: string;
   bounds: [number, number, number, number];
   clickable: boolean;
   focusable: boolean;
@@ -77,6 +78,24 @@ export interface Snapshot {
   timestamp: number;
 }
 
+export interface LogEntry {
+  epochMs: number;
+  pid: number | null;
+  tid: number | null;
+  priority: string;
+  tag: string;
+  message: string;
+  raw: string;
+}
+
+export interface AppLogResult {
+  baselineEpochMs: number | null;
+  pid: number | null;
+  lines: string[];
+  entries: LogEntry[];
+  crashes: string[];
+}
+
 interface AdbCommandResult {
   stdout: string;
   stderr: string;
@@ -88,6 +107,9 @@ interface RawUiNode {
   node?: RawUiNode | RawUiNode[];
   [key: string]: unknown;
 }
+
+const LOGCAT_EPOCH_PATTERN =
+  /^\s*(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+([VDIWEAF])\s+([^:]+):\s?(.*)$/;
 
 function dedupe(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())).map((value) => value.trim()))];
@@ -416,6 +438,21 @@ export async function isAppRunning(
   return result.stdout.trim().length > 0;
 }
 
+export async function getAppPid(
+  packageName: string,
+  serial?: string,
+): Promise<number | null> {
+  const result = await adb(["shell", "pidof", packageName], serial, { allowFailure: true });
+  const raw = result.stdout.trim();
+  if (!raw) {
+    return null;
+  }
+
+  const firstPid = raw.split(/\s+/)[0];
+  const parsed = Number.parseInt(firstPid, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 async function getCurrentScreen(serial?: string): Promise<string> {
   const activityDump = await adb(
     ["shell", "dumpsys", "activity", "activities"],
@@ -484,6 +521,102 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+export function extractComposeTestTag(resourceId: string | undefined): string | undefined {
+  if (!resourceId) {
+    return undefined;
+  }
+
+  const normalized = resourceId.trim();
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized.includes(":id/")) {
+    return normalized.slice(normalized.indexOf(":id/") + 4).trim() || undefined;
+  }
+
+  if (normalized.includes("/")) {
+    return normalized.slice(normalized.lastIndexOf("/") + 1).trim() || undefined;
+  }
+
+  return normalized;
+}
+
+export function formatLogcatEpoch(epochMs: number): string {
+  return (epochMs / 1000).toFixed(3);
+}
+
+export function parseLogcatEntries(output: string): LogEntry[] {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0 && !line.startsWith("---------"))
+    .reduce<LogEntry[]>((entries, line) => {
+      const match = line.match(LOGCAT_EPOCH_PATTERN);
+      if (!match) {
+        return entries;
+      }
+
+      const [, epochSeconds, pid, tid, priority, tag, message] = match;
+      entries.push({
+        epochMs: Math.round(Number.parseFloat(epochSeconds) * 1000),
+        pid: Number.parseInt(pid, 10),
+        tid: Number.parseInt(tid, 10),
+        priority,
+        tag: tag.trim(),
+        message,
+        raw: line,
+      });
+      return entries;
+    }, []);
+}
+
+function isCrashEntry(entry: LogEntry): boolean {
+  return (
+    entry.tag.includes("AndroidRuntime") ||
+    entry.message.includes("FATAL EXCEPTION") ||
+    entry.message.includes("Process: ") ||
+    entry.message.includes(" ANR in ")
+  );
+}
+
+export function extractCrashSummaries(
+  entries: LogEntry[],
+  options?: { packageName?: string; pid?: number | null },
+): string[] {
+  const packageName = options?.packageName?.toLowerCase();
+  const targetPid = options?.pid ?? null;
+  const windows = new Map<number, LogEntry[]>();
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!isCrashEntry(entry)) {
+      continue;
+    }
+
+    const pid = entry.pid ?? targetPid ?? -1;
+    const currentWindow = windows.get(pid) ?? [];
+    for (let cursor = index; cursor < Math.min(entries.length, index + 12); cursor += 1) {
+      const candidate = entries[cursor];
+      if (targetPid !== null && candidate.pid !== targetPid) {
+        continue;
+      }
+      currentWindow.push(candidate);
+    }
+    windows.set(pid, currentWindow);
+  }
+
+  return [...windows.values()]
+    .map((windowEntries) => {
+      const raw = [...new Set(windowEntries.map((entry) => entry.raw))].join("\n");
+      const matchesPackage = packageName
+        ? raw.toLowerCase().includes(packageName)
+        : true;
+      return matchesPackage ? raw : null;
+    })
+    .filter((value): value is string => value !== null);
+}
+
 function isInteractiveNode(node: RawUiNode): boolean {
   return (
     asBoolean(node.clickable) ||
@@ -528,11 +661,12 @@ function parseUiDump(xml: string, interactiveOnly: boolean): UIElement[] {
     const hint = asString(node.hint);
     const contentDesc = asString(node["content-desc"]);
     const resourceId = asString(node["resource-id"]);
+    const testTag = extractComposeTestTag(resourceId);
 
     const keep =
       visible &&
       (!interactiveOnly || isInteractiveNode(node)) &&
-      (isInteractiveNode(node) || text || hint || contentDesc || resourceId);
+      (isInteractiveNode(node) || text || hint || contentDesc || resourceId || testTag);
 
     if (keep) {
       const className = asString(node.class) ?? "android.view.View";
@@ -543,6 +677,7 @@ function parseUiDump(xml: string, interactiveOnly: boolean): UIElement[] {
         hint,
         contentDesc,
         resourceId,
+        testTag,
         bounds: parseBounds(asString(node.bounds) ?? ""),
         clickable,
         focusable,
@@ -702,11 +837,13 @@ export async function scroll(
   const verticalStart = Math.round(display.height * 0.8);
   const verticalEnd = Math.round(display.height * 0.25);
 
+  // `direction` follows the content/navigation intent, not the finger gesture.
+  // Example: scrolling "down" should reveal lower content, which requires an upward swipe.
   const swipes: Record<typeof direction, [number, number, number, number]> = {
-    up: [centerX, verticalStart, centerX, verticalEnd],
-    down: [centerX, verticalEnd, centerX, verticalStart],
-    left: [horizontalStart, centerY, horizontalEnd, centerY],
-    right: [horizontalEnd, centerY, horizontalStart, centerY],
+    up: [centerX, verticalEnd, centerX, verticalStart],
+    down: [centerX, verticalStart, centerX, verticalEnd],
+    left: [horizontalEnd, centerY, horizontalStart, centerY],
+    right: [horizontalStart, centerY, horizontalEnd, centerY],
   };
 
   const [x1, y1, x2, y2] = swipes[direction];
@@ -723,42 +860,61 @@ export async function pressBack(serial?: string): Promise<void> {
 
 export async function getAppLogs(
   packageName: string,
-  maxLines: number = 50,
-  serial?: string,
-): Promise<{ lines: string[]; crashes: string[] }> {
-  const pidResult = await adb(["shell", "pidof", packageName], serial, { allowFailure: true });
-  const pid = pidResult.stdout.trim();
+  options?: {
+    maxLines?: number;
+    serial?: string;
+    sinceEpochMs?: number | null;
+    pid?: number | null;
+  },
+): Promise<AppLogResult> {
+  const maxLines = options?.maxLines ?? 50;
+  const serial = options?.serial;
+  const currentPid = options?.pid ?? await getAppPid(packageName, serial);
+  const logArgs = ["shell", "logcat", "-d", "-v", "epoch"];
 
-  const logArgs = pid
-    ? ["shell", "logcat", "-d", "-v", "brief", "--pid", pid, "-t", String(maxLines)]
-    : ["shell", "logcat", "-d", "-v", "brief", "-t", String(maxLines)];
+  if (options?.sinceEpochMs) {
+    logArgs.push("-T", formatLogcatEpoch(options.sinceEpochMs));
+  }
+
+  if (currentPid !== null) {
+    logArgs.push("--pid", String(currentPid));
+  }
 
   const logResult = await adb(logArgs, serial, { allowFailure: true, timeoutMs: 20_000 });
-  const lines = logResult.stdout.split(/\r?\n/).map((line) => line.trimEnd()).filter(Boolean);
+  const entries = parseLogcatEntries(logResult.stdout);
+  const lines = entries.slice(-maxLines).map((entry) => entry.raw);
+  const crashes = extractCrashSummaries(entries, { packageName, pid: currentPid });
 
-  const crashes = lines.filter(
-    (line) =>
-      line.includes("FATAL EXCEPTION") ||
-      line.includes("AndroidRuntime") ||
-      line.includes("Process: ") ||
-      line.includes(" java.lang.") ||
-      (line.includes("kotlin.") && line.includes("Exception")),
-  );
-
-  return { lines, crashes };
+  return {
+    baselineEpochMs: options?.sinceEpochMs ?? null,
+    pid: currentPid,
+    lines,
+    entries,
+    crashes,
+  };
 }
 
 export async function checkHealth(
   packageName: string,
-  serial?: string,
+  options?: {
+    serial?: string;
+    pid?: number | null;
+    sessionBaselineEpochMs?: number | null;
+    launchBaselineEpochMs?: number | null;
+  },
 ): Promise<{
   appRunning: boolean;
   pid: number | null;
   memoryMb: number | null;
+  logsPid: number | null;
+  logBaselineEpochMs: number | null;
+  launchBaselineEpochMs: number | null;
+  crashesSinceSession: number;
   crashesSinceLaunch: number;
 }> {
-  const pidResult = await adb(["shell", "pidof", packageName], serial, { allowFailure: true });
-  const pid = pidResult.stdout.trim() ? parseInt(pidResult.stdout.trim(), 10) : null;
+  const serial = options?.serial;
+  const pid = await getAppPid(packageName, serial);
+  const logsPid = pid ?? options?.pid ?? null;
 
   let memoryMb: number | null = null;
   if (pid) {
@@ -775,12 +931,29 @@ export async function checkHealth(
     }
   }
 
-  const { crashes } = await getAppLogs(packageName, 200, serial);
+  const sessionLogs = await getAppLogs(packageName, {
+    maxLines: 200,
+    serial,
+    sinceEpochMs: options?.sessionBaselineEpochMs ?? null,
+    pid: logsPid,
+  });
+  const launchLogs = options?.launchBaselineEpochMs
+    ? await getAppLogs(packageName, {
+        maxLines: 200,
+        serial,
+        sinceEpochMs: options.launchBaselineEpochMs,
+        pid: logsPid,
+      })
+    : null;
 
   return {
     appRunning: pid !== null,
     pid,
+    logsPid,
     memoryMb,
-    crashesSinceLaunch: crashes.length,
+    logBaselineEpochMs: options?.sessionBaselineEpochMs ?? null,
+    launchBaselineEpochMs: options?.launchBaselineEpochMs ?? null,
+    crashesSinceSession: sessionLogs.crashes.length,
+    crashesSinceLaunch: launchLogs?.crashes.length ?? 0,
   };
 }

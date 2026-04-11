@@ -14,19 +14,28 @@ export interface Session {
   device: Device | null;
   packageName: string | null;
   lastSnapshot: Snapshot | null;
+  previousSnapshot: Snapshot | null;
+  logBaselineEpochMs: number;
+  launchBaselineEpochMs: number | null;
+  lastKnownPid: number | null;
   startedAt: number;
 }
 
 let activeSession: Session | null = null;
 
 export function createSession(): Session {
+  const now = Date.now();
   activeSession = {
-    id: `s${Date.now()}`,
+    id: `s${now}`,
     project: null,
     device: null,
     packageName: null,
     lastSnapshot: null,
-    startedAt: Date.now(),
+    previousSnapshot: null,
+    logBaselineEpochMs: now,
+    launchBaselineEpochMs: null,
+    lastKnownPid: null,
+    startedAt: now,
   };
   return activeSession;
 }
@@ -47,6 +56,13 @@ export function requireSession(): Session {
 export function updateSession(updates: Partial<Session>): Session {
   const session = requireSession();
   Object.assign(session, updates);
+  return session;
+}
+
+export function setSessionSnapshot(snapshot: Snapshot): Session {
+  const session = requireSession();
+  session.previousSnapshot = session.lastSnapshot;
+  session.lastSnapshot = snapshot;
   return session;
 }
 

@@ -15,18 +15,48 @@ import { AdbError } from "./engines/adb.js";
 import * as adb from "./engines/adb.js";
 import { GradleError } from "./engines/gradle.js";
 import * as gradle from "./engines/gradle.js";
+import { compareSnapshots } from "./engines/snapshot-diff.js";
+import {
+  describeElement,
+  describeQuery,
+  type ElementQuery,
+  findMatchingElements,
+} from "./engines/selectors.js";
 import {
   closeSession,
   createSession,
   getSession,
   requireSession,
+  setSessionSnapshot,
   updateSession,
 } from "./engines/session.js";
 
 const server = new McpServer({
   name: "droidpilot",
-  version: "0.2.0",
+  version: "0.4.0",
 });
+
+const elementQueryShape = {
+  ref: z.string().optional().describe("Exact snapshot ref, for example '@e1'"),
+  resourceId: z.string().optional().describe("Exact Android resource id"),
+  resourceIdContains: z.string().optional().describe("Substring match against resource id"),
+  testTag: z.string().optional().describe("Exact Compose testTag value when testTagsAsResourceId is enabled"),
+  testTagContains: z.string().optional().describe("Substring match against Compose testTag"),
+  text: z.string().optional().describe("Exact visible text"),
+  textContains: z.string().optional().describe("Substring match against visible text"),
+  contentDesc: z.string().optional().describe("Exact content description"),
+  contentDescContains: z.string().optional().describe("Substring match against content description"),
+  hint: z.string().optional().describe("Exact hint text"),
+  hintContains: z.string().optional().describe("Substring match against hint text"),
+  type: z.string().optional().describe("Exact view type, for example 'Button'"),
+  clickable: z.boolean().optional(),
+  focusable: z.boolean().optional(),
+  scrollable: z.boolean().optional(),
+  editable: z.boolean().optional(),
+  enabled: z.boolean().optional(),
+  checked: z.boolean().optional(),
+  selected: z.boolean().optional(),
+};
 
 function jsonResponse(payload: unknown) {
   return {
@@ -77,6 +107,38 @@ function normalizePackageName(): string | null {
   return session?.packageName ?? session?.project?.applicationId ?? null;
 }
 
+function normalizeElementQuery(args: Record<string, unknown>): ElementQuery {
+  return {
+    ref: typeof args.ref === "string" ? args.ref : undefined,
+    resourceId: typeof args.resourceId === "string" ? args.resourceId : undefined,
+    resourceIdContains: typeof args.resourceIdContains === "string" ? args.resourceIdContains : undefined,
+    testTag: typeof args.testTag === "string" ? args.testTag : undefined,
+    testTagContains: typeof args.testTagContains === "string" ? args.testTagContains : undefined,
+    text: typeof args.text === "string" ? args.text : undefined,
+    textContains: typeof args.textContains === "string" ? args.textContains : undefined,
+    contentDesc: typeof args.contentDesc === "string" ? args.contentDesc : undefined,
+    contentDescContains: typeof args.contentDescContains === "string" ? args.contentDescContains : undefined,
+    hint: typeof args.hint === "string" ? args.hint : undefined,
+    hintContains: typeof args.hintContains === "string" ? args.hintContains : undefined,
+    type: typeof args.type === "string" ? args.type : undefined,
+    clickable: typeof args.clickable === "boolean" ? args.clickable : undefined,
+    focusable: typeof args.focusable === "boolean" ? args.focusable : undefined,
+    scrollable: typeof args.scrollable === "boolean" ? args.scrollable : undefined,
+    editable: typeof args.editable === "boolean" ? args.editable : undefined,
+    enabled: typeof args.enabled === "boolean" ? args.enabled : undefined,
+    checked: typeof args.checked === "boolean" ? args.checked : undefined,
+    selected: typeof args.selected === "boolean" ? args.selected : undefined,
+  };
+}
+
+function isEmptyQuery(query: ElementQuery): boolean {
+  return Object.values(query).every((value) => value === undefined);
+}
+
+function hasSelectorFieldsBeyondRef(query: ElementQuery): boolean {
+  return Object.entries(query).some(([key, value]) => key !== "ref" && value !== undefined);
+}
+
 async function waitForApp(packageName: string, serial?: string, timeoutMs: number = 10_000): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -87,6 +149,187 @@ async function waitForApp(packageName: string, serial?: string, timeoutMs: numbe
   }
   return false;
 }
+
+async function captureSessionSnapshot(interactiveOnly: boolean = true) {
+  const session = requireSession();
+  const snapshot = await adb.captureSnapshot(interactiveOnly, session.device?.serial);
+  setSessionSnapshot(snapshot);
+  return snapshot;
+}
+
+async function getSnapshotForAssertion(refresh: boolean, interactiveOnly: boolean) {
+  const session = requireSession();
+  if (!refresh && session.lastSnapshot) {
+    return session.lastSnapshot;
+  }
+  return captureSessionSnapshot(interactiveOnly);
+}
+
+async function resolveActionTarget(
+  args: Record<string, unknown>,
+  options?: {
+    refreshDefault?: boolean;
+    interactiveOnlyDefault?: boolean;
+  },
+) {
+  const session = requireSession();
+  const query = normalizeElementQuery(args);
+  if (isEmptyQuery(query)) {
+    return {
+      ok: false as const,
+      error: "Provide at least one selector field such as ref, text, resourceId, or contentDesc.",
+      query,
+      queryDescription: describeQuery(query),
+    };
+  }
+
+  const refresh = typeof args.refresh === "boolean" ? args.refresh : (options?.refreshDefault ?? true);
+  const interactiveOnly =
+    typeof args.interactiveOnly === "boolean" ? args.interactiveOnly : (options?.interactiveOnlyDefault ?? false);
+
+  const useStoredSnapshot = query.ref !== undefined && !hasSelectorFieldsBeyondRef(query);
+  const snapshot = useStoredSnapshot
+    ? session.lastSnapshot
+    : await getSnapshotForAssertion(refresh, interactiveOnly);
+
+  if (!snapshot) {
+    return {
+      ok: false as const,
+      error: "No snapshot available for ref-based action. Call 'snapshot' first or use a semantic selector.",
+      query,
+      queryDescription: describeQuery(query),
+    };
+  }
+
+  const matches = findMatchingElements(snapshot, query);
+  if (matches.length === 0) {
+    return {
+      ok: false as const,
+      error: `No visible element matched the selector: ${describeQuery(query)}.`,
+      query,
+      queryDescription: describeQuery(query),
+      screen: snapshot.screen,
+      package: snapshot.packageName,
+      matchCount: 0,
+    };
+  }
+
+  return {
+    ok: true as const,
+    snapshot,
+    query,
+    queryDescription: describeQuery(query),
+    matchCount: matches.length,
+    element: matches[0],
+  };
+}
+
+async function waitForElementMatch(
+  query: ElementQuery,
+  options: {
+    timeoutMs: number;
+    intervalMs: number;
+    interactiveOnly: boolean;
+  },
+) {
+  const startedAt = Date.now();
+  let lastSnapshot = await captureSessionSnapshot(options.interactiveOnly);
+  let matches = findMatchingElements(lastSnapshot, query);
+
+  while (matches.length === 0 && Date.now() - startedAt < options.timeoutMs) {
+    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+    lastSnapshot = await captureSessionSnapshot(options.interactiveOnly);
+    matches = findMatchingElements(lastSnapshot, query);
+  }
+
+  return {
+    snapshot: lastSnapshot,
+    matches,
+    waitedMs: Date.now() - startedAt,
+  };
+}
+
+server.tool(
+  "doctor",
+  "Validate the local DroidPilot environment: adb resolution, connected devices, selected device, project detection, and an optional UI snapshot probe.",
+  {
+    projectDir: z.string().optional().describe("Optional Android project root to validate."),
+    deviceSerial: z.string().optional().describe("Optional explicit device serial."),
+    preferEmulator: z.boolean().optional().describe("Prefer an emulator when auto-selecting. Default: true"),
+    checkSnapshot: z.boolean().optional().describe("Attempt a lightweight UI snapshot on the chosen device. Default: false"),
+  },
+  toolHandler(async ({ projectDir, deviceSerial, preferEmulator, checkSnapshot }) => {
+    const report: Record<string, unknown> = {
+      status: "ok",
+      nodeVersion: process.version,
+      javaHome: process.env.JAVA_HOME ?? null,
+      androidHome: process.env.ANDROID_HOME ?? process.env.ANDROID_SDK_ROOT ?? null,
+    };
+
+    try {
+      report.adbPath = await adb.getAdbPath();
+    } catch (error) {
+      return {
+        ...report,
+        ...serializeError(error),
+      };
+    }
+
+    const devices = await adb.listDevices();
+    report.devices = devices;
+    report.readyDevices = devices.filter((device) => device.status === "device").length;
+
+    try {
+      const selectedDevice = await adb.getActiveDevice(deviceSerial, preferEmulator ?? true);
+      report.selectedDevice = selectedDevice;
+    } catch (error) {
+      report.selectedDeviceError = serializeError(error);
+    }
+
+    if (projectDir) {
+      const project = await gradle.detectProject(projectDir);
+      report.project = project
+        ? {
+            detected: true,
+            ...project,
+          }
+        : {
+            detected: false,
+          };
+    }
+
+    if (checkSnapshot) {
+      const selectedDevice = report.selectedDevice as adb.Device | undefined;
+      if (selectedDevice?.serial) {
+        try {
+          const snapshot = await adb.captureSnapshot(true, selectedDevice.serial);
+          report.snapshotProbe = {
+            ok: true,
+            screen: snapshot.screen,
+            package: snapshot.packageName,
+            elementCount: snapshot.elements.length,
+          };
+        } catch (error) {
+          report.snapshotProbe = {
+            ok: false,
+            error: serializeError(error),
+          };
+        }
+      } else {
+        report.snapshotProbe = {
+          ok: false,
+          error: "No ready device available for snapshot probe.",
+        };
+      }
+    }
+
+    if (!report.selectedDevice) {
+      report.status = "warning";
+    }
+
+    return report;
+  }),
+);
 
 server.tool(
   "open",
@@ -118,10 +361,14 @@ server.tool(
     }
 
     const session = createSession();
+    const lastKnownPid = project.applicationId
+      ? await adb.getAppPid(project.applicationId, device.serial)
+      : null;
     updateSession({
       project,
       device,
       packageName: project.applicationId ?? null,
+      lastKnownPid,
     });
 
     return {
@@ -135,6 +382,10 @@ server.tool(
         buildVariant: project.buildVariant,
       },
       device,
+      baselines: {
+        sessionLogEpochMs: session.logBaselineEpochMs,
+        launchLogEpochMs: session.launchBaselineEpochMs,
+      },
       availableDevices: devices,
     };
   }),
@@ -223,6 +474,7 @@ server.tool(
       };
     }
 
+    const launchBaselineEpochMs = Date.now();
     const launchResult = await adb.launchApp(packageName, buildResult.launchActivity, serial);
     if (!launchResult.success) {
       return {
@@ -234,8 +486,11 @@ server.tool(
     }
 
     const running = await waitForApp(packageName, serial, 12_000);
+    const lastKnownPid = await adb.getAppPid(packageName, serial);
     updateSession({
       packageName,
+      lastKnownPid,
+      launchBaselineEpochMs,
       project: {
         ...session.project,
         applicationId: packageName,
@@ -252,6 +507,10 @@ server.tool(
       warningsCount: buildResult.warningsCount,
       summary: buildResult.summary,
       outputTail: buildResult.outputTail,
+      baselines: {
+        sessionLogEpochMs: session.logBaselineEpochMs,
+        launchLogEpochMs: launchBaselineEpochMs,
+      },
     };
   }),
 );
@@ -263,15 +522,15 @@ server.tool(
     interactiveOnly: z.boolean().optional().describe("Only include interactive elements. Default: true"),
   },
   toolHandler(async ({ interactiveOnly }) => {
+    const snapshot = await captureSessionSnapshot(interactiveOnly ?? true);
     const session = requireSession();
-    const snapshot = await adb.captureSnapshot(interactiveOnly ?? true, session.device?.serial);
-    updateSession({ lastSnapshot: snapshot });
 
     return {
       status: "ok",
       screen: snapshot.screen,
       package: snapshot.packageName,
       elementCount: snapshot.elements.length,
+      previousSnapshotAvailable: session.previousSnapshot !== null,
       elements: snapshot.elements.map((element) => ({
         ref: element.ref,
         type: element.type,
@@ -279,6 +538,7 @@ server.tool(
         hint: element.hint,
         contentDesc: element.contentDesc,
         resourceId: element.resourceId,
+        testTag: element.testTag,
         clickable: element.clickable,
         focusable: element.focusable,
         scrollable: element.scrollable,
@@ -292,23 +552,257 @@ server.tool(
 );
 
 server.tool(
-  "tap",
-  "Tap a UI element by ref (for example @e1).",
+  "snapshot_diff",
+  "Compare two consecutive UI snapshots to understand what changed before and after a navigation or action.",
   {
-    ref: z.string().describe("Element reference from snapshot, e.g. '@e1'"),
+    refresh: z.boolean().optional().describe("Capture a fresh snapshot before diffing. Default: true"),
+    interactiveOnly: z.boolean().optional().describe("Only include interactive elements when refreshing. Default: true"),
+    maxItems: z.number().optional().describe("Maximum number of added, removed, and changed elements to return. Default: 10"),
   },
-  toolHandler(async ({ ref }) => {
+  toolHandler(async ({ refresh, interactiveOnly, maxItems }) => {
     const session = requireSession();
-    if (!session.lastSnapshot) {
-      return { status: "error", error: "No snapshot available. Call 'snapshot' first." };
+    const shouldRefresh = refresh ?? true;
+    if (shouldRefresh) {
+      if (!session.lastSnapshot) {
+        return {
+          status: "error",
+          error: "snapshot_diff needs a baseline snapshot first. Call 'snapshot' before the action you want to compare.",
+        };
+      }
+      await captureSessionSnapshot(interactiveOnly ?? true);
     }
 
-    const result = await adb.tap(ref, session.lastSnapshot, session.device?.serial);
+    const updatedSession = requireSession();
+    if (!updatedSession.previousSnapshot || !updatedSession.lastSnapshot) {
+      return {
+        status: "error",
+        error: "snapshot_diff needs two consecutive snapshots. Call 'snapshot', perform the action, then call 'snapshot_diff'.",
+      };
+    }
+
+    const diff = compareSnapshots(updatedSession.previousSnapshot, updatedSession.lastSnapshot);
+    const limit = Math.max(1, maxItems ?? 10);
+
+    return {
+      ...diff,
+      addedElements: diff.addedElements.slice(0, limit),
+      removedElements: diff.removedElements.slice(0, limit),
+      changedElements: diff.changedElements.slice(0, limit),
+    };
+  }),
+);
+
+server.tool(
+  "wait_for_element",
+  "Wait until an element matching the query appears in the current UI snapshot.",
+  {
+    ...elementQueryShape,
+    timeoutMs: z.number().optional().describe("Maximum wait time in milliseconds. Default: 10000"),
+    intervalMs: z.number().optional().describe("Polling interval in milliseconds. Default: 500"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements while polling. Default: false"),
+  },
+  toolHandler(async (args) => {
+    const query = normalizeElementQuery(args);
+    if (isEmptyQuery(query)) {
+      return {
+        status: "error",
+        error: "wait_for_element requires at least one selector field such as ref, text, resourceId, or contentDesc.",
+      };
+    }
+
+    const result = await waitForElementMatch(query, {
+      timeoutMs: args.timeoutMs ?? 10_000,
+      intervalMs: args.intervalMs ?? 500,
+      interactiveOnly: args.interactiveOnly ?? false,
+    });
+
+    return {
+      status: result.matches.length > 0 ? "ok" : "timeout",
+      query,
+      queryDescription: describeQuery(query),
+      waitedMs: result.waitedMs,
+      screen: result.snapshot.screen,
+      package: result.snapshot.packageName,
+      matchCount: result.matches.length,
+      firstMatch: result.matches[0]
+        ? {
+            ...result.matches[0],
+            description: describeElement(result.matches[0]),
+          }
+        : null,
+    };
+  }),
+);
+
+server.tool(
+  "assert_visible",
+  "Assert that at least one element matching the query is visible in the current UI.",
+  {
+    ...elementQueryShape,
+    refresh: z.boolean().optional().describe("Refresh the snapshot before asserting. Default: true"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements. Default: false"),
+  },
+  toolHandler(async (args) => {
+    const query = normalizeElementQuery(args);
+    if (isEmptyQuery(query)) {
+      return {
+        status: "error",
+        error: "assert_visible requires at least one selector field such as ref, text, resourceId, or contentDesc.",
+      };
+    }
+
+    const snapshot = await getSnapshotForAssertion(args.refresh ?? true, args.interactiveOnly ?? false);
+    const matches = findMatchingElements(snapshot, query);
+
+    return {
+      status: matches.length > 0 ? "passed" : "failed",
+      assertion: "visible",
+      query,
+      queryDescription: describeQuery(query),
+      screen: snapshot.screen,
+      package: snapshot.packageName,
+      matchCount: matches.length,
+      firstMatch: matches[0]
+        ? {
+            ...matches[0],
+            description: describeElement(matches[0]),
+          }
+        : null,
+    };
+  }),
+);
+
+server.tool(
+  "assert_text",
+  "Assert that an element matching the query has the expected text, content description, or hint.",
+  {
+    ...elementQueryShape,
+    expected: z.string().describe("Expected text value"),
+    source: z.enum(["text", "contentDesc", "hint"]).optional().describe("Field to compare. Default: text"),
+    match: z.enum(["equals", "contains"]).optional().describe("Comparison mode. Default: equals"),
+    refresh: z.boolean().optional().describe("Refresh the snapshot before asserting. Default: true"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements. Default: false"),
+  },
+  toolHandler(async (args) => {
+    const query = normalizeElementQuery(args);
+    if (isEmptyQuery(query)) {
+      return {
+        status: "error",
+        error: "assert_text requires at least one selector field so DroidPilot knows which element to inspect.",
+      };
+    }
+
+    const snapshot = await getSnapshotForAssertion(args.refresh ?? true, args.interactiveOnly ?? false);
+    const matches = findMatchingElements(snapshot, query);
+    const source = args.source ?? "text";
+    const matchMode = args.match ?? "equals";
+    const actual = matches[0]?.[source] ?? null;
+    const passed = matchMode === "contains"
+      ? (actual ?? "").toLowerCase().includes(args.expected.toLowerCase())
+      : (actual ?? "").toLowerCase() === args.expected.toLowerCase();
+
+    return {
+      status: matches.length > 0 && passed ? "passed" : "failed",
+      assertion: "text",
+      query,
+      queryDescription: describeQuery(query),
+      source,
+      match: matchMode,
+      expected: args.expected,
+      actual,
+      screen: snapshot.screen,
+      package: snapshot.packageName,
+      matchCount: matches.length,
+      firstMatch: matches[0]
+        ? {
+            ...matches[0],
+            description: describeElement(matches[0]),
+          }
+        : null,
+    };
+  }),
+);
+
+server.tool(
+  "assert_screen",
+  "Assert the current package or screen/activity after a navigation or action.",
+  {
+    screen: z.string().optional().describe("Expected exact screen/activity"),
+    screenContains: z.string().optional().describe("Expected substring within the current screen/activity"),
+    package: z.string().optional().describe("Expected exact package name"),
+    packageContains: z.string().optional().describe("Expected substring within the package name"),
+    refresh: z.boolean().optional().describe("Refresh the snapshot before asserting. Default: true"),
+  },
+  toolHandler(async ({ screen, screenContains, package: expectedPackage, packageContains, refresh }) => {
+    if (!screen && !screenContains && !expectedPackage && !packageContains) {
+      return {
+        status: "error",
+        error: "assert_screen requires at least one expected field: screen, screenContains, package, or packageContains.",
+      };
+    }
+
+    const snapshot = await getSnapshotForAssertion(refresh ?? true, false);
+    const packageMatches =
+      (expectedPackage === undefined || snapshot.packageName === expectedPackage) &&
+      (packageContains === undefined || snapshot.packageName.toLowerCase().includes(packageContains.toLowerCase()));
+    const screenMatches =
+      (screen === undefined || snapshot.screen === screen) &&
+      (screenContains === undefined || snapshot.screen.toLowerCase().includes(screenContains.toLowerCase()));
+
+    return {
+      status: packageMatches && screenMatches ? "passed" : "failed",
+      assertion: "screen",
+      expected: {
+        screen: screen ?? null,
+        screenContains: screenContains ?? null,
+        package: expectedPackage ?? null,
+        packageContains: packageContains ?? null,
+      },
+      actual: {
+        screen: snapshot.screen,
+        package: snapshot.packageName,
+      },
+    };
+  }),
+);
+
+server.tool(
+  "tap",
+  "Tap a UI element by ref or semantic selector such as text, resourceId, or contentDesc.",
+  {
+    ...elementQueryShape,
+    refresh: z.boolean().optional().describe("Refresh the snapshot before resolving non-ref selectors. Default: true"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements when refreshing. Default: false"),
+  },
+  toolHandler(async (args) => {
+    const target = await resolveActionTarget(args, { refreshDefault: true, interactiveOnlyDefault: false });
+    if (!target.ok) {
+      return {
+        status: "error",
+        error: target.error,
+        query: target.query,
+        queryDescription: target.queryDescription,
+        screen: "screen" in target ? target.screen : undefined,
+        package: "package" in target ? target.package : undefined,
+        matchCount: "matchCount" in target ? target.matchCount : undefined,
+      };
+    }
+
+    const session = requireSession();
+    const result = await adb.tap(target.element.ref, target.snapshot, session.device?.serial);
     await new Promise((resolve) => setTimeout(resolve, 350));
 
     return {
+      status: result.success ? "ok" : "failed",
       action: "tap",
-      target: ref,
+      target: target.element.ref,
+      query: target.query,
+      queryDescription: target.queryDescription,
+      matchCount: target.matchCount,
+      matchedElement: {
+        ...target.element,
+        description: describeElement(target.element),
+      },
       result: result.success ? "ok" : "failed",
       error: result.error,
     };
@@ -317,24 +811,43 @@ server.tool(
 
 server.tool(
   "fill",
-  "Fill a text field by ref. DroidPilot focuses the field, clears the current value, and types the new text.",
+  "Fill a text field by ref or semantic selector. DroidPilot focuses the field, clears the current value, and types the new text.",
   {
-    ref: z.string().describe("Element reference from snapshot, e.g. '@e2'"),
+    ...elementQueryShape,
     text: z.string().describe("Text to type into the field"),
+    refresh: z.boolean().optional().describe("Refresh the snapshot before resolving non-ref selectors. Default: true"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements when refreshing. Default: false"),
   },
-  toolHandler(async ({ ref, text }) => {
-    const session = requireSession();
-    if (!session.lastSnapshot) {
-      return { status: "error", error: "No snapshot available. Call 'snapshot' first." };
+  toolHandler(async (args) => {
+    const target = await resolveActionTarget(args, { refreshDefault: true, interactiveOnlyDefault: false });
+    if (!target.ok) {
+      return {
+        status: "error",
+        error: target.error,
+        query: target.query,
+        queryDescription: target.queryDescription,
+        screen: "screen" in target ? target.screen : undefined,
+        package: "package" in target ? target.package : undefined,
+        matchCount: "matchCount" in target ? target.matchCount : undefined,
+      };
     }
 
-    const result = await adb.fill(ref, text, session.lastSnapshot, session.device?.serial);
+    const session = requireSession();
+    const result = await adb.fill(target.element.ref, args.text, target.snapshot, session.device?.serial);
     await new Promise((resolve) => setTimeout(resolve, 350));
 
     return {
+      status: result.success ? "ok" : "failed",
       action: "fill",
-      target: ref,
-      text,
+      target: target.element.ref,
+      text: args.text,
+      query: target.query,
+      queryDescription: target.queryDescription,
+      matchCount: target.matchCount,
+      matchedElement: {
+        ...target.element,
+        description: describeElement(target.element),
+      },
       result: result.success ? "ok" : "failed",
       error: result.error,
     };
@@ -343,9 +856,9 @@ server.tool(
 
 server.tool(
   "scroll",
-  "Scroll the screen in a direction.",
+  "Scroll in the direction of the content you want to reveal. Example: 'down' reveals lower items in a list.",
   {
-    direction: z.enum(["up", "down", "left", "right"]).describe("Scroll direction"),
+    direction: z.enum(["up", "down", "left", "right"]).describe("Direction of the content you want to reach, not the finger gesture"),
   },
   toolHandler(async ({ direction }) => {
     const session = requireSession();
@@ -396,32 +909,50 @@ server.tool(
 
 server.tool(
   "logs",
-  "Get recent app logs (logcat), filtered by the app PID when possible.",
+  "Get recent app logs (logcat), using session or launch baselines and the latest known app PID when possible.",
   {
     maxLines: z.number().optional().describe("Max log lines to return. Default: 50"),
+    scope: z.enum(["session", "launch"]).optional().describe("Choose the baseline for log collection. Default: launch when available, otherwise session."),
   },
-  toolHandler(async ({ maxLines }) => {
+  toolHandler(async ({ maxLines, scope }) => {
     const session = requireSession();
     const packageName = normalizePackageName();
     if (!packageName) {
       return { status: "error", error: "No package name is known yet. Run the app first." };
     }
 
-    const result = await adb.getAppLogs(packageName, maxLines ?? 50, session.device?.serial);
+    const effectiveScope = scope ?? (session.launchBaselineEpochMs ? "launch" : "session");
+    const baselineEpochMs = effectiveScope === "launch"
+      ? (session.launchBaselineEpochMs ?? session.logBaselineEpochMs)
+      : session.logBaselineEpochMs;
+    const currentPid = await adb.getAppPid(packageName, session.device?.serial);
+    const logsPid = currentPid ?? session.lastKnownPid;
+    updateSession({ lastKnownPid: logsPid ?? null });
+    const result = await adb.getAppLogs(packageName, {
+      maxLines: maxLines ?? 50,
+      serial: session.device?.serial,
+      sinceEpochMs: baselineEpochMs,
+      pid: logsPid,
+    });
 
     return {
+      status: "ok",
+      scope: effectiveScope,
       package: packageName,
+      pid: currentPid,
+      logsPid: result.pid,
+      baselineEpochMs,
       lineCount: result.lines.length,
       crashCount: result.crashes.length,
       crashes: result.crashes,
-      lines: result.lines.slice(-Math.min(result.lines.length, maxLines ?? 50)),
+      lines: result.lines,
     };
   }),
 );
 
 server.tool(
   "health",
-  "Check whether the app is running, its memory usage, and whether recent logs indicate crashes.",
+  "Check whether the app is running, its memory usage, and whether logs since this session or launch indicate crashes.",
   {},
   toolHandler(async () => {
     const session = requireSession();
@@ -430,9 +961,20 @@ server.tool(
       return { status: "error", error: "No package name is known yet. Run the app first." };
     }
 
-    const result = await adb.checkHealth(packageName, session.device?.serial);
+    const currentPid = await adb.getAppPid(packageName, session.device?.serial);
+    const logsPid = currentPid ?? session.lastKnownPid;
+    updateSession({ lastKnownPid: logsPid ?? null });
+    const result = await adb.checkHealth(packageName, {
+      serial: session.device?.serial,
+      pid: logsPid,
+      sessionBaselineEpochMs: session.logBaselineEpochMs,
+      launchBaselineEpochMs: session.launchBaselineEpochMs,
+    });
     return {
+      status: "ok",
       package: packageName,
+      sessionLogBaselineEpochMs: session.logBaselineEpochMs,
+      launchLogBaselineEpochMs: session.launchBaselineEpochMs,
       ...result,
     };
   }),
