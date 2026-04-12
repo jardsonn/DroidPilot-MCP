@@ -6,12 +6,20 @@ export interface ElementQuery {
   resourceIdContains?: string;
   testTag?: string;
   testTagContains?: string;
+  label?: string;
+  labelContains?: string;
   text?: string;
   textContains?: string;
   contentDesc?: string;
   contentDescContains?: string;
   hint?: string;
   hintContains?: string;
+  parentTextContains?: string;
+  childTextContains?: string;
+  siblingTextContains?: string;
+  contextTextContains?: string;
+  nearText?: string;
+  nearTextContains?: string;
   type?: string;
   clickable?: boolean;
   focusable?: boolean;
@@ -30,6 +38,66 @@ function containsIgnoreCase(haystack: string | undefined, needle: string | undef
   return (haystack ?? "").toLowerCase().includes((needle ?? "").toLowerCase());
 }
 
+function center(bounds: [number, number, number, number]): [number, number] {
+  return [
+    (bounds[0] + bounds[2]) / 2,
+    (bounds[1] + bounds[3]) / 2,
+  ];
+}
+
+function distanceBetween(left: UIElement, right: UIElement): number {
+  const [leftX, leftY] = center(left.bounds);
+  const [rightX, rightY] = center(right.bounds);
+  return Math.hypot(leftX - rightX, leftY - rightY);
+}
+
+function anchorTextMatches(element: UIElement, exact?: string, contains?: string): boolean {
+  const fields = [
+    element.text,
+    element.contentDesc,
+    element.hint,
+    element.label,
+    element.parentText,
+    element.childText,
+    element.siblingText,
+    element.contextText,
+  ];
+
+  if (exact !== undefined) {
+    return fields.some((field) => equalsIgnoreCase(field, exact));
+  }
+  if (contains !== undefined) {
+    return fields.some((field) => containsIgnoreCase(field, contains));
+  }
+  return false;
+}
+
+function proximityScore(candidate: UIElement, anchors: UIElement[]): number {
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (const anchor of anchors) {
+    let score = distanceBetween(candidate, anchor);
+
+    if (candidate.containerPath && anchor.containerPath && candidate.containerPath === anchor.containerPath) {
+      score *= 0.25;
+    } else if (candidate.parentRef && anchor.parentRef && candidate.parentRef === anchor.parentRef) {
+      score *= 0.45;
+    }
+
+    if (candidate.contextText && anchor.text && containsIgnoreCase(candidate.contextText, anchor.text)) {
+      score *= 0.7;
+    }
+
+    if (candidate.ref === anchor.ref) {
+      score += 10_000;
+    }
+
+    bestScore = Math.min(bestScore, score);
+  }
+
+  return bestScore;
+}
+
 export function matchesElement(element: UIElement, query: ElementQuery): boolean {
   if (query.ref !== undefined && element.ref !== query.ref) {
     return false;
@@ -44,6 +112,12 @@ export function matchesElement(element: UIElement, query: ElementQuery): boolean
     return false;
   }
   if (query.testTagContains !== undefined && !containsIgnoreCase(element.testTag, query.testTagContains)) {
+    return false;
+  }
+  if (query.label !== undefined && !equalsIgnoreCase(element.label, query.label)) {
+    return false;
+  }
+  if (query.labelContains !== undefined && !containsIgnoreCase(element.label, query.labelContains)) {
     return false;
   }
   if (query.text !== undefined && !equalsIgnoreCase(element.text, query.text)) {
@@ -65,6 +139,18 @@ export function matchesElement(element: UIElement, query: ElementQuery): boolean
     return false;
   }
   if (query.hintContains !== undefined && !containsIgnoreCase(element.hint, query.hintContains)) {
+    return false;
+  }
+  if (query.parentTextContains !== undefined && !containsIgnoreCase(element.parentText, query.parentTextContains)) {
+    return false;
+  }
+  if (query.childTextContains !== undefined && !containsIgnoreCase(element.childText, query.childTextContains)) {
+    return false;
+  }
+  if (query.siblingTextContains !== undefined && !containsIgnoreCase(element.siblingText, query.siblingTextContains)) {
+    return false;
+  }
+  if (query.contextTextContains !== undefined && !containsIgnoreCase(element.contextText, query.contextTextContains)) {
     return false;
   }
   if (query.type !== undefined && !equalsIgnoreCase(element.type, query.type)) {
@@ -96,7 +182,20 @@ export function matchesElement(element: UIElement, query: ElementQuery): boolean
 }
 
 export function findMatchingElements(snapshot: Snapshot, query: ElementQuery): UIElement[] {
-  return snapshot.elements.filter((element) => matchesElement(element, query));
+  const matches = snapshot.elements.filter((element) => matchesElement(element, query));
+  const hasNearConstraint = query.nearText !== undefined || query.nearTextContains !== undefined;
+  if (!hasNearConstraint) {
+    return matches;
+  }
+
+  const anchors = snapshot.elements.filter((element) =>
+    anchorTextMatches(element, query.nearText, query.nearTextContains),
+  );
+  if (anchors.length === 0) {
+    return [];
+  }
+
+  return [...matches].sort((left, right) => proximityScore(left, anchors) - proximityScore(right, anchors));
 }
 
 export function describeElement(element: UIElement): string {
@@ -104,9 +203,11 @@ export function describeElement(element: UIElement): string {
     element.ref,
     element.type,
     element.text ? `text="${element.text}"` : null,
+    !element.text && element.label ? `label="${element.label}"` : null,
     element.contentDesc ? `contentDesc="${element.contentDesc}"` : null,
     element.resourceId ? `resourceId="${element.resourceId}"` : null,
     element.testTag ? `testTag="${element.testTag}"` : null,
+    !element.text && element.contextText ? `context="${element.contextText}"` : null,
     element.selected ? "selected=true" : null,
   ].filter(Boolean);
 

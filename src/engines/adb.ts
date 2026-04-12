@@ -5,7 +5,7 @@
  * UI inspection, screenshots, interaction, and logcat.
  */
 
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, constants } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -28,6 +28,13 @@ const uiXmlParser = new XMLParser({
 });
 
 let cachedAdbPathPromise: Promise<string> | null = null;
+const activeRecordings = new Map<string, {
+  process: ChildProcess;
+  remotePath: string;
+  startedAt: number;
+  stdout: string[];
+  stderr: string[];
+}>();
 
 export class AdbError extends Error {
   constructor(
@@ -61,6 +68,15 @@ export interface UIElement {
   contentDesc?: string;
   resourceId?: string;
   testTag?: string;
+  label?: string;
+  parentRef?: string;
+  nodePath?: string;
+  containerPath?: string;
+  depth?: number;
+  parentText?: string;
+  childText?: string;
+  siblingText?: string;
+  contextText?: string;
   bounds: [number, number, number, number];
   clickable: boolean;
   focusable: boolean;
@@ -108,8 +124,34 @@ interface RawUiNode {
   [key: string]: unknown;
 }
 
+interface ParsedUiNode {
+  path: string;
+  depth: number;
+  className: string;
+  text?: string;
+  hint?: string;
+  contentDesc?: string;
+  resourceId?: string;
+  testTag?: string;
+  bounds: [number, number, number, number];
+  clickable: boolean;
+  focusable: boolean;
+  scrollable: boolean;
+  enabled: boolean;
+  editable: boolean;
+  checked: boolean;
+  selected: boolean;
+  visible: boolean;
+  keep: boolean;
+  ownTexts: string[];
+  subtreeTexts: string[];
+  parent?: ParsedUiNode;
+  children: ParsedUiNode[];
+}
+
 const LOGCAT_EPOCH_PATTERN =
   /^\s*(\d+(?:\.\d+)?)\s+(\d+)\s+(\d+)\s+([VDIWEAF])\s+([^:]+):\s?(.*)$/;
+const MAX_CONTEXT_TOKENS = 8;
 
 function dedupe(values: Array<string | undefined | null>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())).map((value) => value.trim()))];
@@ -228,6 +270,33 @@ async function adb(
       result,
     );
   }
+}
+
+function recordingKey(serial?: string): string {
+  return serial ?? "__default__";
+}
+
+async function waitForProcessExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{ exited: boolean; code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve({ exited: false, code: null, signal: null });
+      }
+    }, timeoutMs);
+
+    child.once("exit", (code, signal) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ exited: true, code, signal });
+      }
+    });
+  });
 }
 
 function parseDeviceLine(line: string): Device | null {
@@ -423,6 +492,43 @@ export async function launchApp(
   };
 }
 
+export async function openDeeplink(
+  uri: string,
+  options?: {
+    packageName?: string | null;
+    serial?: string;
+  },
+): Promise<{ success: boolean; error?: string; component?: string }> {
+  const args = [
+    "shell",
+    "am",
+    "start",
+    "-W",
+    "-a",
+    "android.intent.action.VIEW",
+    "-d",
+    uri,
+  ];
+
+  if (options?.packageName) {
+    args.push("-p", options.packageName);
+  }
+
+  const result = await adb(args, options?.serial, { allowFailure: true, timeoutMs: 30_000 });
+  const output = `${result.stdout}\n${result.stderr}`;
+  if (parseAmStartOutput(output)) {
+    return {
+      success: false,
+      error: output.trim() || `Failed to open deeplink '${uri}'.`,
+    };
+  }
+
+  return {
+    success: true,
+    component: parseResolvedActivity(result.stdout) ?? undefined,
+  };
+}
+
 export async function stopApp(
   packageName: string,
   serial?: string,
@@ -519,6 +625,26 @@ function asBoolean(value: unknown): boolean {
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function uniqueTextTokens(...groups: Array<string | undefined | string[]>): string[] {
+  const tokens = groups.flatMap((group) => {
+    if (Array.isArray(group)) {
+      return group;
+    }
+    return group ? [group] : [];
+  });
+
+  return [...new Set(
+    tokens
+      .map((token) => token.trim())
+      .filter((token) => token.length > 0),
+  )].slice(0, MAX_CONTEXT_TOKENS);
+}
+
+function summarizeTextTokens(tokens: string[]): string | undefined {
+  const normalized = uniqueTextTokens(tokens);
+  return normalized.length > 0 ? normalized.join(" | ") : undefined;
 }
 
 export function extractComposeTestTag(resourceId: string | undefined): string | undefined {
@@ -635,6 +761,149 @@ function flattenChildren(node: RawUiNode): RawUiNode[] {
   return Array.isArray(child) ? child : [child];
 }
 
+function buildParsedUiNode(
+  rawNode: RawUiNode,
+  interactiveOnly: boolean,
+  path: string,
+  depth: number,
+  parent?: ParsedUiNode,
+): ParsedUiNode {
+  const clickable = asBoolean(rawNode.clickable);
+  const focusable = asBoolean(rawNode.focusable);
+  const scrollable = asBoolean(rawNode.scrollable);
+  const editable = asBoolean(rawNode.editable);
+  const enabled = rawNode.enabled === undefined ? true : asBoolean(rawNode.enabled);
+  const checked = asBoolean(rawNode.checked);
+  const selected = asBoolean(rawNode.selected);
+  const visible = rawNode["visible-to-user"] === undefined ? true : asBoolean(rawNode["visible-to-user"]);
+  const text = asString(rawNode.text);
+  const hint = asString(rawNode.hint);
+  const contentDesc = asString(rawNode["content-desc"]);
+  const resourceId = asString(rawNode["resource-id"]);
+  const testTag = extractComposeTestTag(resourceId);
+  const ownTexts = uniqueTextTokens(text, contentDesc, hint);
+  const className = asString(rawNode.class) ?? "android.view.View";
+
+  const parsedNode: ParsedUiNode = {
+    path,
+    depth,
+    className,
+    text,
+    hint,
+    contentDesc,
+    resourceId,
+    testTag,
+    bounds: parseBounds(asString(rawNode.bounds) ?? ""),
+    clickable,
+    focusable,
+    scrollable,
+    enabled,
+    editable,
+    checked,
+    selected,
+    visible,
+    keep: false,
+    ownTexts,
+    subtreeTexts: [],
+    parent,
+    children: [],
+  };
+
+  parsedNode.children = flattenChildren(rawNode).map((child, index) =>
+    buildParsedUiNode(child, interactiveOnly, `${path}.${index}`, depth + 1, parsedNode),
+  );
+  parsedNode.subtreeTexts = uniqueTextTokens(
+    parsedNode.ownTexts,
+    ...parsedNode.children.map((child) => child.subtreeTexts),
+  );
+
+  parsedNode.keep =
+    parsedNode.visible &&
+    (!interactiveOnly || isInteractiveNode(rawNode)) &&
+    (isInteractiveNode(rawNode) || parsedNode.ownTexts.length > 0 || Boolean(resourceId) || Boolean(testTag));
+
+  return parsedNode;
+}
+
+function collectNearestAncestorTexts(node: ParsedUiNode): string[] {
+  let current = node.parent;
+  while (current) {
+    if (current.ownTexts.length > 0) {
+      return current.ownTexts;
+    }
+    current = current.parent;
+  }
+  return [];
+}
+
+function collectSiblingTexts(node: ParsedUiNode): string[] {
+  if (!node.parent) {
+    return [];
+  }
+
+  return uniqueTextTokens(
+    ...node.parent.children
+      .filter((candidate) => candidate.path !== node.path)
+      .map((candidate) => candidate.subtreeTexts),
+  );
+}
+
+function flattenParsedUiTree(rootNode: ParsedUiNode): UIElement[] {
+  const elements: UIElement[] = [];
+  let refCounter = 1;
+
+  const visit = (node: ParsedUiNode, nearestKeptAncestorRef?: string) => {
+    let nextAncestorRef = nearestKeptAncestorRef;
+
+    if (node.keep) {
+      const ref = `@e${refCounter++}`;
+      const parentTexts = collectNearestAncestorTexts(node);
+      const childTexts = uniqueTextTokens(...node.children.map((child) => child.subtreeTexts));
+      const siblingTexts = collectSiblingTexts(node);
+      const contextTexts = uniqueTextTokens(node.ownTexts, childTexts, siblingTexts, parentTexts, node.testTag);
+      const label = uniqueTextTokens(node.ownTexts, childTexts, siblingTexts, parentTexts, node.testTag)[0];
+
+      elements.push({
+        ref,
+        type: node.className.split(".").pop() ?? node.className,
+        text: node.text,
+        hint: node.hint,
+        contentDesc: node.contentDesc,
+        resourceId: node.resourceId,
+        testTag: node.testTag,
+        label,
+        parentRef: nearestKeptAncestorRef,
+        nodePath: node.path,
+        containerPath: node.parent?.path,
+        depth: node.depth,
+        parentText: summarizeTextTokens(parentTexts),
+        childText: summarizeTextTokens(childTexts),
+        siblingText: summarizeTextTokens(siblingTexts),
+        contextText: summarizeTextTokens(contextTexts),
+        bounds: node.bounds,
+        clickable: node.clickable,
+        focusable: node.focusable,
+        scrollable: node.scrollable,
+        enabled: node.enabled,
+        editable: node.editable,
+        checked: node.checked,
+        selected: node.selected,
+      });
+      nextAncestorRef = ref;
+    }
+
+    for (const child of node.children) {
+      visit(child, nextAncestorRef);
+    }
+  };
+
+  for (const child of rootNode.children) {
+    visit(child);
+  }
+
+  return elements;
+}
+
 function parseUiDump(xml: string, interactiveOnly: boolean): UIElement[] {
   const parsed = uiXmlParser.parse(xml) as { hierarchy?: RawUiNode };
   const rootNode = parsed.hierarchy;
@@ -643,62 +912,8 @@ function parseUiDump(xml: string, interactiveOnly: boolean): UIElement[] {
     throw new AdbError("UI_DUMP_INVALID", "uiautomator dump did not produce a readable hierarchy.");
   }
 
-  const elements: UIElement[] = [];
-  let refCounter = 1;
-
-  const visit = (node: RawUiNode) => {
-    const children = flattenChildren(node);
-
-    const clickable = asBoolean(node.clickable);
-    const focusable = asBoolean(node.focusable);
-    const scrollable = asBoolean(node.scrollable);
-    const editable = asBoolean(node.editable);
-    const enabled = node.enabled === undefined ? true : asBoolean(node.enabled);
-    const checked = asBoolean(node.checked);
-    const selected = asBoolean(node.selected);
-    const visible = node["visible-to-user"] === undefined ? true : asBoolean(node["visible-to-user"]);
-    const text = asString(node.text);
-    const hint = asString(node.hint);
-    const contentDesc = asString(node["content-desc"]);
-    const resourceId = asString(node["resource-id"]);
-    const testTag = extractComposeTestTag(resourceId);
-
-    const keep =
-      visible &&
-      (!interactiveOnly || isInteractiveNode(node)) &&
-      (isInteractiveNode(node) || text || hint || contentDesc || resourceId || testTag);
-
-    if (keep) {
-      const className = asString(node.class) ?? "android.view.View";
-      elements.push({
-        ref: `@e${refCounter++}`,
-        type: className.split(".").pop() ?? className,
-        text,
-        hint,
-        contentDesc,
-        resourceId,
-        testTag,
-        bounds: parseBounds(asString(node.bounds) ?? ""),
-        clickable,
-        focusable,
-        scrollable,
-        enabled,
-        editable,
-        checked,
-        selected,
-      });
-    }
-
-    for (const child of children) {
-      visit(child);
-    }
-  };
-
-  for (const child of flattenChildren(rootNode)) {
-    visit(child);
-  }
-
-  return elements;
+  const parsedRoot = buildParsedUiNode(rootNode, interactiveOnly, "0", 0);
+  return flattenParsedUiTree(parsedRoot);
 }
 
 export async function captureSnapshot(
@@ -742,6 +957,133 @@ export async function takeScreenshot(
   }
 
   return localPath;
+}
+
+export async function startScreenRecording(
+  remotePath: string,
+  options?: {
+    serial?: string;
+    bitRateMbps?: number;
+    timeLimitSec?: number;
+  },
+): Promise<{ success: boolean; error?: string; remotePath?: string }> {
+  const key = recordingKey(options?.serial);
+  if (activeRecordings.has(key)) {
+    return {
+      success: false,
+      error: "A screen recording is already active for this device/session.",
+    };
+  }
+
+  const adbPath = await resolveAdbPath();
+  const args = [
+    ...(options?.serial ? ["-s", options.serial] : []),
+    "shell",
+    "screenrecord",
+  ];
+
+  if (options?.bitRateMbps) {
+    args.push("--bit-rate", String(Math.round(options.bitRateMbps * 1_000_000)));
+  }
+  if (options?.timeLimitSec) {
+    args.push("--time-limit", String(Math.max(1, Math.min(180, Math.round(options.timeLimitSec)))));
+  }
+
+  args.push(remotePath);
+
+  const child = spawn(adbPath, args, {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  child.stdout.on("data", (chunk) => stdout.push(String(chunk)));
+  child.stderr.on("data", (chunk) => stderr.push(String(chunk)));
+
+  activeRecordings.set(key, {
+    process: child,
+    remotePath,
+    startedAt: Date.now(),
+    stdout,
+    stderr,
+  });
+
+  const startup = await waitForProcessExit(child, 700);
+  if (startup.exited) {
+    activeRecordings.delete(key);
+    return {
+      success: false,
+      error: [...stdout, ...stderr].join("").trim() || "screenrecord exited before it could start.",
+    };
+  }
+
+  return {
+    success: true,
+    remotePath,
+  };
+}
+
+async function requestRemoteScreenRecordingStop(serial?: string): Promise<void> {
+  const stopCommands = [
+    ["shell", "pkill", "-INT", "screenrecord"],
+    ["shell", "killall", "-INT", "screenrecord"],
+  ];
+
+  for (const command of stopCommands) {
+    const result = await adb(command, serial, { allowFailure: true, timeoutMs: 5_000 });
+    const output = `${result.stdout}\n${result.stderr}`.trim().toLowerCase();
+    if (result.exitCode === 0 || output.length === 0 || output.includes("no process killed")) {
+      return;
+    }
+  }
+}
+
+export async function stopScreenRecording(
+  localPath: string,
+  options?: {
+    serial?: string;
+    remotePath?: string;
+  },
+): Promise<{ success: boolean; error?: string; path?: string; durationMs?: number }> {
+  const key = recordingKey(options?.serial);
+  const active = activeRecordings.get(key);
+  if (!active) {
+    return {
+      success: false,
+      error: "No active screen recording was found for this device/session.",
+    };
+  }
+
+  await requestRemoteScreenRecordingStop(options?.serial);
+  const exit = await waitForProcessExit(active.process, 3_000);
+  if (!exit.exited) {
+    active.process.kill("SIGTERM");
+    await waitForProcessExit(active.process, 2_000);
+  }
+
+  const remotePath = options?.remotePath ?? active.remotePath;
+  const pullResult = await adb(["pull", remotePath, localPath], options?.serial, {
+    allowFailure: true,
+    timeoutMs: 120_000,
+  });
+  await adb(["shell", "rm", remotePath], options?.serial, { allowFailure: true, timeoutMs: 10_000 });
+  activeRecordings.delete(key);
+
+  const output = `${pullResult.stdout}\n${pullResult.stderr}`.trim();
+  if (pullResult.exitCode !== 0 || /error|failed/i.test(output)) {
+    return {
+      success: false,
+      error: output || "Failed to pull the recorded video from the device.",
+      durationMs: Date.now() - active.startedAt,
+    };
+  }
+
+  return {
+    success: true,
+    path: localPath,
+    durationMs: Date.now() - active.startedAt,
+  };
 }
 
 function center(bounds: [number, number, number, number]): [number, number] {

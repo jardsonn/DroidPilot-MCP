@@ -36,8 +36,13 @@ O DroidPilot já cobre o loop principal de feedback local para agentes Android:
 - snapshots de acessibilidade
 - interações básicas de UI
 - waits e assertions por seletor
+- snapshots ricos em contexto para elementos clicáveis sem texto
 - diff entre snapshots consecutivos
+- abertura de deeplink
+- helpers para idle e scroll guiado por objetivo
 - captura de screenshot
+- captura de artefatos por sessão
+- gravação de vídeo da tela
 - coleta de logs consciente de sessão
 - health checks do app com baseline de crash
 - diagnósticos de ambiente
@@ -68,10 +73,12 @@ Com o DroidPilot, um agente pode:
 5. inspecionar a UI atual em formato compacto
 6. esperar elementos e validar texto, visibilidade ou screen/activity
 7. tocar botões e preencher campos por ref, seletor ou Compose test tag
-8. comparar dois snapshots consecutivos depois de uma navegação
-9. rolar listas, voltar e capturar screenshots
-10. coletar logs e sinais de saúde do app com baseline de sessão
-11. iterar sobre mudanças de código usando o mesmo loop local Android
+8. usar seletores relacionais como `nearText` para desambiguar botões repetidos em listas
+9. esperar a UI entrar em idle depois de navegação ou carga assíncrona
+10. rolar até encontrar um alvo, abrir deeplinks e comparar snapshots consecutivos
+11. capturar screenshots e vídeos em uma pasta de artefatos por sessão
+12. coletar logs e sinais de saúde do app com baseline de sessão
+13. iterar sobre mudanças de código usando o mesmo loop local Android
 
 ---
 
@@ -295,6 +302,7 @@ Argumentos:
 - `projectDir: string`
 - `deviceSerial?: string`
 - `preferEmulator?: boolean`
+- `artifactsDir?: string`
 
 ### `doctor`
 
@@ -354,6 +362,19 @@ Retorna:
 - warnings
 - summary
 
+### `open_deeplink`
+
+Abre um deeplink ou URI web no device atual, opcionalmente mirando o package atual do app, e pode esperar a UI estabilizar.
+
+Argumentos:
+
+- `uri: string`
+- `packageName?: string`
+- `waitForIdle?: boolean`
+- `idleMs?: number`
+- `timeoutMs?: number`
+- `interactiveOnly?: boolean`
+
 ### `snapshot`
 
 Captura a hierarquia de UI atual e devolve referências compactas como `@e1`, `@e2` e assim por diante.
@@ -367,18 +388,29 @@ Retorna:
 - screen/activity atual
 - package atual
 - número de elementos
-- lista simplificada de elementos
+- lista simplificada de elementos com `label`, `parentText`, `childText`, `siblingText` e `contextText` quando disponíveis
 
 Seletores suportados nas tools de wait/assert/action:
 
 - `ref`
 - `resourceId` / `resourceIdContains`
 - `testTag` / `testTagContains`
+- `label` / `labelContains`
 - `text` / `textContains`
 - `contentDesc` / `contentDescContains`
 - `hint` / `hintContains`
+- `parentTextContains`
+- `childTextContains`
+- `siblingTextContains`
+- `contextTextContains`
+- `nearText` / `nearTextContains`
 - `type`
 - flags booleanas como `clickable`, `editable`, `enabled`, `selected`, `checked`
+
+Nota relacional:
+
+- `nearText` é um desambiguador, não um seletor completo sozinho
+- combine com um seletor de alvo, como `clickable=true`, `textContains`, `resourceId` ou `type`
 
 Nota sobre Compose:
 
@@ -441,6 +473,33 @@ Argumentos:
 - `interactiveOnly?: boolean`
 - `maxItems?: number`
 
+### `wait_for_idle`
+
+Espera até a UI parar de mudar por uma pequena janela de tempo.
+
+Argumentos:
+
+- `timeoutMs?: number`
+- `idleMs?: number`
+- `pollIntervalMs?: number`
+- `interactiveOnly?: boolean`
+- `ignoreTextualChanges?: boolean`
+- `maxChangedElements?: number`
+- `maxAddedElements?: number`
+- `maxRemovedElements?: number`
+
+### `scroll_until`
+
+Rola repetidamente em uma direção até aparecer um elemento compatível com o seletor ou o limite ser atingido.
+
+Argumentos:
+
+- qualquer campo de seletor listado acima
+- `direction: "up" | "down" | "left" | "right"`
+- `maxScrolls?: number`
+- `pauseMs?: number`
+- `interactiveOnly?: boolean`
+
 ### `tap`
 
 Toca em um elemento do último snapshot ou resolve o primeiro match a partir de um seletor semântico.
@@ -481,11 +540,29 @@ Pressiona o botão voltar do Android.
 
 ### `screenshot`
 
-Captura uma screenshot PNG do device atual.
+Captura uma screenshot PNG do device atual. Por padrão ela cai na pasta de artefatos da sessão atual.
 
 Argumentos:
 
 - `outputPath?: string`
+
+### `artifacts`
+
+Mostra a pasta de artefatos da sessão atual e os arquivos já capturados ali.
+
+### `record_video_start`
+
+Inicia a gravação da tela do device na pasta de artefatos da sessão atual.
+
+Argumentos:
+
+- `outputPath?: string`
+- `bitRateMbps?: number`
+- `timeLimitSec?: number`
+
+### `record_video_stop`
+
+Para a gravação ativa e puxa o MP4 para a máquina local.
 
 ### `logs`
 
@@ -602,6 +679,18 @@ Retorna sinais de runtime do app:
 }
 ```
 
+### `wait_for_idle`
+
+```json
+{
+  "status": "ok",
+  "waitedMs": 1054,
+  "stableForMs": 941,
+  "screen": "com.example.meuapp/.ProfileActivity",
+  "package": "com.example.meuapp"
+}
+```
+
 ---
 
 ## Exemplos de prompts para agentes
@@ -656,9 +745,13 @@ O DroidPilot foi desenhado para ser resiliente nos pontos mais importantes do de
 - suporta `gradlew.bat` no Windows
 - interpreta padrões comuns de falha de build e devolve diagnósticos estruturados
 - usa parser XML real para snapshots de UI
+- enriquece snapshots com contexto de pai/irmão/filho para facilitar identificar controles sem texto
 - suporta seletores semânticos para waits, assertions e ações de UI
+- suporta desambiguação relacional com `nearText`
 - suporta seletores explícitos de Compose `testTag` quando eles são expostos via acessibilidade / resource IDs
 - acompanha baseline de logs/crashes por sessão e por launch
+- tolera churn só de texto no `wait_for_idle` por padrão
+- salva snapshots, diffs, screenshots e vídeos por sessão em uma pasta de artefatos previsível
 - tenta resolver a launchable activity em vez de assumir `.MainActivity`
 
 Ainda assim, o DroidPilot continua dependente das limitações naturais da automação Android:
@@ -759,6 +852,7 @@ src/
   index.ts              servidor MCP e registro das tools
   engines/
     adb.ts              descoberta de device, inspeção de UI, interação e logs
+    artifacts.ts        caminhos e persistência de artefatos da sessão
     gradle.ts           detecção de projeto, build e descoberta de APK
     selectors.ts        matching semântico de seletores para waits, assertions e ações
     snapshot-diff.ts    diff de UI entre snapshots consecutivos
@@ -769,6 +863,7 @@ build/
 
 test/
   adb-utils.test.mjs    testes do parser de logs e helper de Compose test tag
+  artifacts.test.mjs    testes de caminhos e persistência de artefatos
   gradle.test.mjs       testes de regressão do build engine
   selectors.test.mjs    testes de regressão dos seletores
   snapshot-diff.test.mjs testes de regressão do diff de snapshots
@@ -785,11 +880,15 @@ Ao trabalhar no DroidPilot em si, uma boa sequência de validação é:
    - `devices`
    - `open`
    - `snapshot`
+   - `wait_for_idle`
 5. depois validar um app Android real com:
    - `run`
+   - `open_deeplink`
    - `snapshot`
+   - `scroll_until`
    - `snapshot_diff`
    - `tap`
+   - `artifacts`
    - `health`
    - `logs`
 
@@ -797,11 +896,11 @@ Ao trabalhar no DroidPilot em si, uma boa sequência de validação é:
 
 ## Roadmap
 
-- gravação e replay de fluxos
+- fluxos de captura reutilizáveis / packs de telas scriptáveis
 - suporte mais rico a semântica Compose além de `testTagsAsResourceId`
 - transporte HTTP / daemon mode
 - integração com CI
-- captura de artefatos mais rica
+- captura de artefatos mais rica e bundles de exportação
 - suporte a múltiplas sessões
 
 ---

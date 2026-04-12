@@ -13,11 +13,26 @@ export interface Session {
   project: ProjectInfo | null;
   device: Device | null;
   packageName: string | null;
+  artifactsDir: string | null;
+  lastSnapshotArtifactPath: string | null;
+  lastDiffArtifactPath: string | null;
   lastSnapshot: Snapshot | null;
   previousSnapshot: Snapshot | null;
   logBaselineEpochMs: number;
   launchBaselineEpochMs: number | null;
   lastKnownPid: number | null;
+  artifactCounters: {
+    snapshot: number;
+    screenshot: number;
+    diff: number;
+    video: number;
+  };
+  recording: {
+    remotePath: string;
+    localPath: string;
+    startedAt: number;
+    serial: string | null;
+  } | null;
   startedAt: number;
 }
 
@@ -30,11 +45,21 @@ export function createSession(): Session {
     project: null,
     device: null,
     packageName: null,
+    artifactsDir: null,
+    lastSnapshotArtifactPath: null,
+    lastDiffArtifactPath: null,
     lastSnapshot: null,
     previousSnapshot: null,
     logBaselineEpochMs: now,
     launchBaselineEpochMs: null,
     lastKnownPid: null,
+    artifactCounters: {
+      snapshot: 0,
+      screenshot: 0,
+      diff: 0,
+      video: 0,
+    },
+    recording: null,
     startedAt: now,
   };
   return activeSession;

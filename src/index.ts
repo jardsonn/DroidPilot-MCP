@@ -7,15 +7,23 @@
  * inspect, and interact with Android apps on emulators/devices.
  */
 
+import { join } from "node:path";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod/v4";
 
 import { AdbError } from "./engines/adb.js";
 import * as adb from "./engines/adb.js";
+import {
+  createSessionArtifactsDir,
+  listArtifacts,
+  nextArtifactPath,
+  writeJsonArtifact,
+} from "./engines/artifacts.js";
 import { GradleError } from "./engines/gradle.js";
 import * as gradle from "./engines/gradle.js";
-import { compareSnapshots } from "./engines/snapshot-diff.js";
+import { compareSnapshots, evaluateSnapshotStability } from "./engines/snapshot-diff.js";
 import {
   describeElement,
   describeQuery,
@@ -33,7 +41,7 @@ import {
 
 const server = new McpServer({
   name: "droidpilot",
-  version: "0.4.0",
+  version: "0.5.0",
 });
 
 const elementQueryShape = {
@@ -42,12 +50,20 @@ const elementQueryShape = {
   resourceIdContains: z.string().optional().describe("Substring match against resource id"),
   testTag: z.string().optional().describe("Exact Compose testTag value when testTagsAsResourceId is enabled"),
   testTagContains: z.string().optional().describe("Substring match against Compose testTag"),
+  label: z.string().optional().describe("Best-effort label derived from the element's own or nearby text"),
+  labelContains: z.string().optional().describe("Substring match against the best-effort label"),
   text: z.string().optional().describe("Exact visible text"),
   textContains: z.string().optional().describe("Substring match against visible text"),
   contentDesc: z.string().optional().describe("Exact content description"),
   contentDescContains: z.string().optional().describe("Substring match against content description"),
   hint: z.string().optional().describe("Exact hint text"),
   hintContains: z.string().optional().describe("Substring match against hint text"),
+  parentTextContains: z.string().optional().describe("Match text exposed by the nearest textual ancestor"),
+  childTextContains: z.string().optional().describe("Match text exposed by descendants of the element"),
+  siblingTextContains: z.string().optional().describe("Match text exposed by sibling nodes in the same container"),
+  contextTextContains: z.string().optional().describe("Match any nearby context text gathered from parent, sibling, or child nodes"),
+  nearText: z.string().optional().describe("Prefer the candidate nearest to this anchor text"),
+  nearTextContains: z.string().optional().describe("Prefer the candidate nearest to text containing this value"),
   type: z.string().optional().describe("Exact view type, for example 'Button'"),
   clickable: z.boolean().optional(),
   focusable: z.boolean().optional(),
@@ -114,12 +130,20 @@ function normalizeElementQuery(args: Record<string, unknown>): ElementQuery {
     resourceIdContains: typeof args.resourceIdContains === "string" ? args.resourceIdContains : undefined,
     testTag: typeof args.testTag === "string" ? args.testTag : undefined,
     testTagContains: typeof args.testTagContains === "string" ? args.testTagContains : undefined,
+    label: typeof args.label === "string" ? args.label : undefined,
+    labelContains: typeof args.labelContains === "string" ? args.labelContains : undefined,
     text: typeof args.text === "string" ? args.text : undefined,
     textContains: typeof args.textContains === "string" ? args.textContains : undefined,
     contentDesc: typeof args.contentDesc === "string" ? args.contentDesc : undefined,
     contentDescContains: typeof args.contentDescContains === "string" ? args.contentDescContains : undefined,
     hint: typeof args.hint === "string" ? args.hint : undefined,
     hintContains: typeof args.hintContains === "string" ? args.hintContains : undefined,
+    parentTextContains: typeof args.parentTextContains === "string" ? args.parentTextContains : undefined,
+    childTextContains: typeof args.childTextContains === "string" ? args.childTextContains : undefined,
+    siblingTextContains: typeof args.siblingTextContains === "string" ? args.siblingTextContains : undefined,
+    contextTextContains: typeof args.contextTextContains === "string" ? args.contextTextContains : undefined,
+    nearText: typeof args.nearText === "string" ? args.nearText : undefined,
+    nearTextContains: typeof args.nearTextContains === "string" ? args.nearTextContains : undefined,
     type: typeof args.type === "string" ? args.type : undefined,
     clickable: typeof args.clickable === "boolean" ? args.clickable : undefined,
     focusable: typeof args.focusable === "boolean" ? args.focusable : undefined,
@@ -135,8 +159,69 @@ function isEmptyQuery(query: ElementQuery): boolean {
   return Object.values(query).every((value) => value === undefined);
 }
 
+function hasPrimarySelectorFields(query: ElementQuery): boolean {
+  return Object.entries(query).some(
+    ([key, value]) => !["nearText", "nearTextContains"].includes(key) && value !== undefined,
+  );
+}
+
 function hasSelectorFieldsBeyondRef(query: ElementQuery): boolean {
   return Object.entries(query).some(([key, value]) => key !== "ref" && value !== undefined);
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function nextSessionArtifactSequence(kind: "snapshot" | "screenshot" | "diff" | "video") {
+  const session = requireSession();
+  const nextValue = session.artifactCounters[kind] + 1;
+  updateSession({
+    artifactCounters: {
+      ...session.artifactCounters,
+      [kind]: nextValue,
+    },
+  });
+  return nextValue;
+}
+
+async function writeSnapshotArtifact(snapshot: adb.Snapshot, interactiveOnly: boolean): Promise<string | null> {
+  const session = requireSession();
+  if (!session.artifactsDir) {
+    return null;
+  }
+
+  const sequence = await nextSessionArtifactSequence("snapshot");
+  const path = await writeJsonArtifact(session.artifactsDir, "snapshots", sequence, {
+    interactiveOnly,
+    capturedAt: new Date(snapshot.timestamp).toISOString(),
+    snapshot,
+  });
+  updateSession({ lastSnapshotArtifactPath: path });
+  return path;
+}
+
+async function writeDiffArtifact(diff: unknown): Promise<string | null> {
+  const session = requireSession();
+  if (!session.artifactsDir) {
+    return null;
+  }
+
+  const sequence = await nextSessionArtifactSequence("diff");
+  const path = await writeJsonArtifact(session.artifactsDir, "diffs", sequence, diff);
+  updateSession({ lastDiffArtifactPath: path });
+  return path;
+}
+
+async function nextSessionFileArtifactPath(kind: "screenshots" | "videos", extension: string): Promise<string | null> {
+  const session = requireSession();
+  if (!session.artifactsDir) {
+    return null;
+  }
+
+  const counterKind = kind === "screenshots" ? "screenshot" : "video";
+  const sequence = await nextSessionArtifactSequence(counterKind);
+  return nextArtifactPath(session.artifactsDir, kind, sequence, extension);
 }
 
 async function waitForApp(packageName: string, serial?: string, timeoutMs: number = 10_000): Promise<boolean> {
@@ -145,7 +230,7 @@ async function waitForApp(packageName: string, serial?: string, timeoutMs: numbe
     if (await adb.isAppRunning(packageName, serial)) {
       return true;
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500);
   }
   return false;
 }
@@ -154,6 +239,7 @@ async function captureSessionSnapshot(interactiveOnly: boolean = true) {
   const session = requireSession();
   const snapshot = await adb.captureSnapshot(interactiveOnly, session.device?.serial);
   setSessionSnapshot(snapshot);
+  await writeSnapshotArtifact(snapshot, interactiveOnly);
   return snapshot;
 }
 
@@ -178,6 +264,14 @@ async function resolveActionTarget(
     return {
       ok: false as const,
       error: "Provide at least one selector field such as ref, text, resourceId, or contentDesc.",
+      query,
+      queryDescription: describeQuery(query),
+    };
+  }
+  if (!hasPrimarySelectorFields(query)) {
+    return {
+      ok: false as const,
+      error: "nearText is a disambiguator, not a full selector by itself. Combine it with a target selector such as clickable=true, textContains, resourceId, or type.",
       query,
       queryDescription: describeQuery(query),
     };
@@ -237,7 +331,7 @@ async function waitForElementMatch(
   let matches = findMatchingElements(lastSnapshot, query);
 
   while (matches.length === 0 && Date.now() - startedAt < options.timeoutMs) {
-    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+    await sleep(options.intervalMs);
     lastSnapshot = await captureSessionSnapshot(options.interactiveOnly);
     matches = findMatchingElements(lastSnapshot, query);
   }
@@ -246,6 +340,84 @@ async function waitForElementMatch(
     snapshot: lastSnapshot,
     matches,
     waitedMs: Date.now() - startedAt,
+  };
+}
+
+async function waitForIdleState(options: {
+  timeoutMs: number;
+  idleMs: number;
+  pollIntervalMs: number;
+  interactiveOnly: boolean;
+  ignoreTextualChanges: boolean;
+  maxChangedElements: number;
+  maxAddedElements: number;
+  maxRemovedElements: number;
+}) {
+  const startedAt = Date.now();
+  let previousSnapshot = await captureSessionSnapshot(options.interactiveOnly);
+  let lastSnapshot = previousSnapshot;
+  let lastMeaningfulChangeAt = Date.now();
+
+  while (Date.now() - startedAt < options.timeoutMs) {
+    if (Date.now() - lastMeaningfulChangeAt >= options.idleMs) {
+      return {
+        status: "ok" as const,
+        snapshot: lastSnapshot,
+        waitedMs: Date.now() - startedAt,
+        stableForMs: Date.now() - lastMeaningfulChangeAt,
+      };
+    }
+
+    await sleep(options.pollIntervalMs);
+    const snapshot = await captureSessionSnapshot(options.interactiveOnly);
+    const stability = evaluateSnapshotStability(previousSnapshot, snapshot, {
+      ignoreTextualChanges: options.ignoreTextualChanges,
+      maxChangedElements: options.maxChangedElements,
+      maxAddedElements: options.maxAddedElements,
+      maxRemovedElements: options.maxRemovedElements,
+    });
+
+    lastSnapshot = snapshot;
+    if (!stability.stable) {
+      lastMeaningfulChangeAt = Date.now();
+    }
+    previousSnapshot = snapshot;
+  }
+
+  return {
+    status: "timeout" as const,
+    snapshot: lastSnapshot,
+    waitedMs: Date.now() - startedAt,
+    stableForMs: Date.now() - lastMeaningfulChangeAt,
+  };
+}
+
+async function scrollUntilMatch(
+  query: ElementQuery,
+  options: {
+    direction: "up" | "down" | "left" | "right";
+    maxScrolls: number;
+    pauseMs: number;
+    interactiveOnly: boolean;
+  },
+) {
+  let snapshot = await captureSessionSnapshot(options.interactiveOnly);
+  let matches = findMatchingElements(snapshot, query);
+  let scrollCount = 0;
+
+  while (matches.length === 0 && scrollCount < options.maxScrolls) {
+    const session = requireSession();
+    await adb.scroll(options.direction, session.device?.serial);
+    scrollCount += 1;
+    await sleep(options.pauseMs);
+    snapshot = await captureSessionSnapshot(options.interactiveOnly);
+    matches = findMatchingElements(snapshot, query);
+  }
+
+  return {
+    snapshot,
+    matches,
+    scrollCount,
   };
 }
 
@@ -338,8 +510,9 @@ server.tool(
     projectDir: z.string().describe("Path to the Android project root (where settings.gradle lives)"),
     deviceSerial: z.string().optional().describe("Specific device/emulator serial to use, e.g. 'emulator-5554'"),
     preferEmulator: z.boolean().optional().describe("Prefer an emulator over a physical device. Default: true"),
+    artifactsDir: z.string().optional().describe("Optional directory for session artifacts such as snapshots, diffs, screenshots, and videos."),
   },
-  toolHandler(async ({ projectDir, deviceSerial, preferEmulator }) => {
+  toolHandler(async ({ projectDir, deviceSerial, preferEmulator, artifactsDir }) => {
     const project = await gradle.detectProject(projectDir);
     if (!project) {
       return {
@@ -361,6 +534,7 @@ server.tool(
     }
 
     const session = createSession();
+    const sessionArtifactsDir = await createSessionArtifactsDir(session.id, artifactsDir);
     const lastKnownPid = project.applicationId
       ? await adb.getAppPid(project.applicationId, device.serial)
       : null;
@@ -368,6 +542,7 @@ server.tool(
       project,
       device,
       packageName: project.applicationId ?? null,
+      artifactsDir: sessionArtifactsDir,
       lastKnownPid,
     });
 
@@ -375,6 +550,7 @@ server.tool(
       status: "ok",
       session: session.id,
       adbPath: await adb.getAdbPath(),
+      artifactsDir: sessionArtifactsDir,
       project: {
         dir: project.projectDir,
         module: project.rootModule,
@@ -397,6 +573,12 @@ server.tool(
   {},
   toolHandler(async () => {
     const session = getSession();
+    if (session?.recording) {
+      await adb.stopScreenRecording(session.recording.localPath, {
+        serial: session.recording.serial ?? undefined,
+        remotePath: session.recording.remotePath,
+      });
+    }
     if (session?.packageName) {
       await adb.stopApp(session.packageName, session.device?.serial);
     }
@@ -516,6 +698,81 @@ server.tool(
 );
 
 server.tool(
+  "open_deeplink",
+  "Open a deeplink/URI on the current device, optionally targeting the current app package, then optionally wait for the UI to settle.",
+  {
+    uri: z.string().describe("Full deeplink URI such as myapp://profile/123 or https://example.com/deeplink"),
+    packageName: z.string().optional().describe("Optional package to target. Defaults to the current session package when known."),
+    waitForIdle: z.boolean().optional().describe("Wait for the UI to settle after opening the deeplink. Default: true"),
+    idleMs: z.number().optional().describe("How long the UI should remain unchanged before considered idle. Default: 900"),
+    timeoutMs: z.number().optional().describe("Maximum wait time when waitForIdle is enabled. Default: 10000"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements during wait_for_idle. Default: false"),
+    ignoreTextualChanges: z.boolean().optional().describe("Ignore text-only churn such as timers or subtle labels while waiting for idle. Default: true"),
+    maxChangedElements: z.number().optional().describe("How many non-textual element changes are tolerated while still considering the UI idle. Default: 1"),
+    maxAddedElements: z.number().optional().describe("How many added elements are tolerated while still considering the UI idle. Default: 0"),
+    maxRemovedElements: z.number().optional().describe("How many removed elements are tolerated while still considering the UI idle. Default: 0"),
+  },
+  toolHandler(async ({
+    uri,
+    packageName,
+    waitForIdle,
+    idleMs,
+    timeoutMs,
+    interactiveOnly,
+    ignoreTextualChanges,
+    maxChangedElements,
+    maxAddedElements,
+    maxRemovedElements,
+  }) => {
+    const session = requireSession();
+    const effectivePackage = packageName ?? session.packageName ?? session.project?.applicationId ?? null;
+    const result = await adb.openDeeplink(uri, {
+      packageName: effectivePackage,
+      serial: session.device?.serial,
+    });
+
+    if (!result.success) {
+      return {
+        status: "failed",
+        uri,
+        package: effectivePackage,
+        error: result.error,
+      };
+    }
+
+    let idleResult: Awaited<ReturnType<typeof waitForIdleState>> | null = null;
+    if (waitForIdle ?? true) {
+      idleResult = await waitForIdleState({
+        timeoutMs: timeoutMs ?? 10_000,
+        idleMs: idleMs ?? 900,
+        pollIntervalMs: 350,
+        interactiveOnly: interactiveOnly ?? false,
+        ignoreTextualChanges: ignoreTextualChanges ?? true,
+        maxChangedElements: maxChangedElements ?? 1,
+        maxAddedElements: maxAddedElements ?? 0,
+        maxRemovedElements: maxRemovedElements ?? 0,
+      });
+    }
+
+    return {
+      status: "ok",
+      uri,
+      package: effectivePackage,
+      activity: result.component ?? null,
+      idle: idleResult
+        ? {
+            status: idleResult.status,
+            waitedMs: idleResult.waitedMs,
+            stableForMs: idleResult.stableForMs,
+            screen: idleResult.snapshot.screen,
+            package: idleResult.snapshot.packageName,
+          }
+        : null,
+    };
+  }),
+);
+
+server.tool(
   "snapshot",
   "Capture the current UI state. Returns the accessibility tree with stable refs like @e1 and @e2.",
   {
@@ -531,14 +788,22 @@ server.tool(
       package: snapshot.packageName,
       elementCount: snapshot.elements.length,
       previousSnapshotAvailable: session.previousSnapshot !== null,
+      artifactPath: session.lastSnapshotArtifactPath,
       elements: snapshot.elements.map((element) => ({
         ref: element.ref,
         type: element.type,
+        label: element.label,
         text: element.text,
         hint: element.hint,
         contentDesc: element.contentDesc,
         resourceId: element.resourceId,
         testTag: element.testTag,
+        parentRef: element.parentRef,
+        depth: element.depth,
+        parentText: element.parentText,
+        childText: element.childText,
+        siblingText: element.siblingText,
+        contextText: element.contextText,
         clickable: element.clickable,
         focusable: element.focusable,
         scrollable: element.scrollable,
@@ -581,13 +846,115 @@ server.tool(
     }
 
     const diff = compareSnapshots(updatedSession.previousSnapshot, updatedSession.lastSnapshot);
+    const artifactPath = await writeDiffArtifact(diff);
     const limit = Math.max(1, maxItems ?? 10);
 
     return {
       ...diff,
+      artifactPath,
       addedElements: diff.addedElements.slice(0, limit),
       removedElements: diff.removedElements.slice(0, limit),
       changedElements: diff.changedElements.slice(0, limit),
+    };
+  }),
+);
+
+server.tool(
+  "wait_for_idle",
+  "Wait until the current UI remains unchanged for a short quiet window. Useful after navigation, scrolls, and async loading.",
+  {
+    timeoutMs: z.number().optional().describe("Maximum wait time in milliseconds. Default: 10000"),
+    idleMs: z.number().optional().describe("How long the UI must stay unchanged before considered idle. Default: 900"),
+    pollIntervalMs: z.number().optional().describe("How often to re-snapshot while polling. Default: 350"),
+    interactiveOnly: z.boolean().optional().describe("Only include interactive elements while checking for UI stability. Default: false"),
+    ignoreTextualChanges: z.boolean().optional().describe("Ignore text-only churn such as timers or subtle labels. Default: true"),
+    maxChangedElements: z.number().optional().describe("How many non-textual element changes are tolerated before resetting idle. Default: 1"),
+    maxAddedElements: z.number().optional().describe("How many added elements are tolerated before resetting idle. Default: 0"),
+    maxRemovedElements: z.number().optional().describe("How many removed elements are tolerated before resetting idle. Default: 0"),
+  },
+  toolHandler(async ({
+    timeoutMs,
+    idleMs,
+    pollIntervalMs,
+    interactiveOnly,
+    ignoreTextualChanges,
+    maxChangedElements,
+    maxAddedElements,
+    maxRemovedElements,
+  }) => {
+    const result = await waitForIdleState({
+      timeoutMs: timeoutMs ?? 10_000,
+      idleMs: idleMs ?? 900,
+      pollIntervalMs: pollIntervalMs ?? 350,
+      interactiveOnly: interactiveOnly ?? false,
+      ignoreTextualChanges: ignoreTextualChanges ?? true,
+      maxChangedElements: maxChangedElements ?? 1,
+      maxAddedElements: maxAddedElements ?? 0,
+      maxRemovedElements: maxRemovedElements ?? 0,
+    });
+    const session = requireSession();
+
+    return {
+      status: result.status,
+      waitedMs: result.waitedMs,
+      stableForMs: result.stableForMs,
+      screen: result.snapshot.screen,
+      package: result.snapshot.packageName,
+      elementCount: result.snapshot.elements.length,
+      artifactPath: session.lastSnapshotArtifactPath,
+    };
+  }),
+);
+
+server.tool(
+  "scroll_until",
+  "Repeatedly scroll in one direction until an element matching the selector appears or the limit is reached.",
+  {
+    ...elementQueryShape,
+    direction: z.enum(["up", "down", "left", "right"]).describe("Direction of the content you want to reach"),
+    maxScrolls: z.number().optional().describe("Maximum number of scroll attempts. Default: 8"),
+    pauseMs: z.number().optional().describe("Pause after each scroll before re-checking. Default: 700"),
+    interactiveOnly: z.boolean().optional().describe("Only inspect interactive elements while searching. Default: false"),
+  },
+  toolHandler(async (args) => {
+    const query = normalizeElementQuery(args);
+    if (isEmptyQuery(query)) {
+      return {
+        status: "error",
+        error: "scroll_until requires at least one selector field such as text, resourceId, contentDesc, or testTag.",
+      };
+    }
+    if (!hasPrimarySelectorFields(query)) {
+      return {
+        status: "error",
+        error: "scroll_until needs a target selector in addition to nearText. Example: clickable=true + nearText='@rafael'.",
+      };
+    }
+
+    const result = await scrollUntilMatch(query, {
+      direction: args.direction,
+      maxScrolls: args.maxScrolls ?? 8,
+      pauseMs: args.pauseMs ?? 700,
+      interactiveOnly: args.interactiveOnly ?? false,
+    });
+    const session = requireSession();
+
+    return {
+      status: result.matches.length > 0 ? "ok" : "not_found",
+      direction: args.direction,
+      query,
+      queryDescription: describeQuery(query),
+      scrollCount: result.scrollCount,
+      screen: result.snapshot.screen,
+      package: result.snapshot.packageName,
+      matchCount: result.matches.length,
+      artifactPath: session.lastSnapshotArtifactPath,
+      firstMatch: result.matches[0]
+        ? {
+            ...result.matches[0],
+            description: describeElement(result.matches[0]),
+          }
+        : null,
     };
   }),
 );
@@ -607,6 +974,12 @@ server.tool(
       return {
         status: "error",
         error: "wait_for_element requires at least one selector field such as ref, text, resourceId, or contentDesc.",
+      };
+    }
+    if (!hasPrimarySelectorFields(query)) {
+      return {
+        status: "error",
+        error: "wait_for_element needs a target selector in addition to nearText. Example: textContains='Registrar' + nearText='@rafael'.",
       };
     }
 
@@ -650,6 +1023,12 @@ server.tool(
         error: "assert_visible requires at least one selector field such as ref, text, resourceId, or contentDesc.",
       };
     }
+    if (!hasPrimarySelectorFields(query)) {
+      return {
+        status: "error",
+        error: "assert_visible needs a target selector in addition to nearText. Example: clickable=true + nearText='@rafael'.",
+      };
+    }
 
     const snapshot = await getSnapshotForAssertion(args.refresh ?? true, args.interactiveOnly ?? false);
     const matches = findMatchingElements(snapshot, query);
@@ -689,6 +1068,12 @@ server.tool(
       return {
         status: "error",
         error: "assert_text requires at least one selector field so DroidPilot knows which element to inspect.",
+      };
+    }
+    if (!hasPrimarySelectorFields(query)) {
+      return {
+        status: "error",
+        error: "assert_text needs a target selector in addition to nearText. Example: textContains='Registrar' + nearText='@rafael'.",
       };
     }
 
@@ -897,12 +1282,125 @@ server.tool(
   },
   toolHandler(async ({ outputPath }) => {
     const session = requireSession();
-    const path = await adb.takeScreenshot(outputPath, session.device?.serial);
+    const artifactPath = outputPath ?? await nextSessionFileArtifactPath("screenshots", ".png");
+    const path = await adb.takeScreenshot(artifactPath ?? undefined, session.device?.serial);
 
     return {
+      status: "ok",
       action: "screenshot",
       path,
       result: "ok",
+    };
+  }),
+);
+
+server.tool(
+  "artifacts",
+  "Show the current session artifact directory and the files already captured for snapshots, diffs, screenshots, and videos.",
+  {},
+  toolHandler(async () => {
+    const session = requireSession();
+    if (!session.artifactsDir) {
+      return {
+        status: "error",
+        error: "No artifact directory is configured for the current session.",
+      };
+    }
+
+    return {
+      status: "ok",
+      artifactsDir: session.artifactsDir,
+      lastSnapshotArtifactPath: session.lastSnapshotArtifactPath,
+      lastDiffArtifactPath: session.lastDiffArtifactPath,
+      recording: session.recording,
+      files: await listArtifacts(session.artifactsDir),
+    };
+  }),
+);
+
+server.tool(
+  "record_video_start",
+  "Start recording the device screen into the current session artifact directory.",
+  {
+    outputPath: z.string().optional().describe("Optional final MP4 path. Defaults to the session videos folder."),
+    bitRateMbps: z.number().optional().describe("Optional screenrecord bitrate in Mbps."),
+    timeLimitSec: z.number().optional().describe("Optional device-side time limit in seconds. Maximum 180."),
+  },
+  toolHandler(async ({ outputPath, bitRateMbps, timeLimitSec }) => {
+    const session = requireSession();
+    if (session.recording) {
+      return {
+        status: "error",
+        error: "A recording is already active for this session. Stop it before starting another one.",
+        recording: session.recording,
+      };
+    }
+
+    const localPath = outputPath ?? await nextSessionFileArtifactPath("videos", ".mp4");
+    if (!localPath) {
+      return {
+        status: "error",
+        error: "DroidPilot could not determine an output path for the video recording.",
+      };
+    }
+
+    const remotePath = `/sdcard/Download/droidpilot-${Date.now()}.mp4`;
+    const result = await adb.startScreenRecording(remotePath, {
+      serial: session.device?.serial,
+      bitRateMbps,
+      timeLimitSec,
+    });
+
+    if (!result.success) {
+      return {
+        status: "failed",
+        error: result.error,
+      };
+    }
+
+    updateSession({
+      recording: {
+        remotePath,
+        localPath,
+        startedAt: Date.now(),
+        serial: session.device?.serial ?? null,
+      },
+    });
+
+    return {
+      status: "recording",
+      path: localPath,
+      remotePath,
+      startedAt: new Date().toISOString(),
+    };
+  }),
+);
+
+server.tool(
+  "record_video_stop",
+  "Stop the active screen recording and pull the MP4 into the session artifact directory.",
+  {},
+  toolHandler(async () => {
+    const session = requireSession();
+    if (!session.recording) {
+      return {
+        status: "error",
+        error: "No active recording exists for this session.",
+      };
+    }
+
+    const recording = session.recording;
+    const result = await adb.stopScreenRecording(recording.localPath, {
+      serial: session.device?.serial ?? undefined,
+      remotePath: recording.remotePath,
+    });
+    updateSession({ recording: null });
+
+    return {
+      status: result.success ? "ok" : "failed",
+      path: result.path ?? recording.localPath,
+      durationMs: result.durationMs,
+      error: result.error,
     };
   }),
 );

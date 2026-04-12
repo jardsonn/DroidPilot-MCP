@@ -4,11 +4,16 @@ import { describeElement } from "./selectors.js";
 export interface SnapshotDiffElementSummary {
   ref: string;
   type: string;
+  label?: string;
   text?: string;
   hint?: string;
   contentDesc?: string;
   resourceId?: string;
   testTag?: string;
+  parentText?: string;
+  childText?: string;
+  siblingText?: string;
+  contextText?: string;
   clickable: boolean;
   editable: boolean;
   enabled: boolean;
@@ -48,6 +53,22 @@ export interface SnapshotDiffResult {
   summary: string;
 }
 
+export interface SnapshotStabilityOptions {
+  ignoreTextualChanges?: boolean;
+  maxChangedElements?: number;
+  maxAddedElements?: number;
+  maxRemovedElements?: number;
+}
+
+export interface SnapshotStabilityResult {
+  stable: boolean;
+  relevantChangedCount: number;
+  ignoredChangedCount: number;
+  relevantAddedCount: number;
+  relevantRemovedCount: number;
+  diff: SnapshotDiffResult;
+}
+
 function normalize(value: string | undefined): string {
   return (value ?? "").trim().toLowerCase();
 }
@@ -56,11 +77,16 @@ function summarizeElement(element: UIElement): SnapshotDiffElementSummary {
   return {
     ref: element.ref,
     type: element.type,
+    label: element.label,
     text: element.text,
     hint: element.hint,
     contentDesc: element.contentDesc,
     resourceId: element.resourceId,
     testTag: element.testTag,
+    parentText: element.parentText,
+    childText: element.childText,
+    siblingText: element.siblingText,
+    contextText: element.contextText,
     clickable: element.clickable,
     editable: element.editable,
     enabled: element.enabled,
@@ -96,12 +122,45 @@ function elementIdentity(element: UIElement): string {
 function elementSecondaryKey(element: UIElement): string {
   return [
     normalize(element.text),
+    normalize(element.label),
     normalize(element.contentDesc),
     normalize(element.hint),
     normalize(element.resourceId),
     normalize(element.testTag),
+    normalize(element.parentText),
+    normalize(element.childText),
+    normalize(element.siblingText),
+    normalize(element.contextText),
     element.bounds.join(","),
   ].join("|");
+}
+
+export function snapshotFingerprint(snapshot: Snapshot): string {
+  const normalizedElements = snapshot.elements
+    .map((element) => [
+      elementIdentity(element),
+      normalize(element.text),
+      normalize(element.label),
+      normalize(element.contentDesc),
+      normalize(element.hint),
+      normalize(element.testTag),
+      normalize(element.parentText),
+      normalize(element.childText),
+      normalize(element.siblingText),
+      normalize(element.contextText),
+      element.bounds.join(","),
+      element.clickable,
+      element.editable,
+      element.enabled,
+      element.selected,
+    ].join("|"))
+    .sort();
+
+  return JSON.stringify({
+    screen: snapshot.screen,
+    package: snapshot.packageName,
+    elements: normalizedElements,
+  });
 }
 
 function groupByIdentity(elements: UIElement[]): Map<string, UIElement[]> {
@@ -124,11 +183,16 @@ function groupByIdentity(elements: UIElement[]): Map<string, UIElement[]> {
 function diffElementFields(before: UIElement, after: UIElement): string[] {
   const fields: Array<keyof UIElement> = [
     "type",
+    "label",
     "text",
     "hint",
     "contentDesc",
     "resourceId",
     "testTag",
+    "parentText",
+    "childText",
+    "siblingText",
+    "contextText",
     "clickable",
     "focusable",
     "scrollable",
@@ -232,5 +296,37 @@ export function compareSnapshots(before: Snapshot, after: Snapshot): SnapshotDif
     removedElements,
     changedElements,
     summary: summaryParts.join("; ") || "No meaningful UI changes detected.",
+  };
+}
+
+export function evaluateSnapshotStability(
+  before: Snapshot,
+  after: Snapshot,
+  options?: SnapshotStabilityOptions,
+): SnapshotStabilityResult {
+  const diff = compareSnapshots(before, after);
+  const ignoreTextualChanges = options?.ignoreTextualChanges ?? true;
+  const ignoredFields = ignoreTextualChanges
+    ? new Set(["text", "label", "hint", "contentDesc", "parentText", "childText", "siblingText", "contextText"])
+    : new Set<string>();
+
+  const relevantChanged = diff.changedElements.filter((element) =>
+    element.changedFields.some((field) => !ignoredFields.has(field)),
+  );
+
+  const stable =
+    !diff.screenChanged &&
+    !diff.packageChanged &&
+    relevantChanged.length <= (options?.maxChangedElements ?? 0) &&
+    diff.addedCount <= (options?.maxAddedElements ?? 0) &&
+    diff.removedCount <= (options?.maxRemovedElements ?? 0);
+
+  return {
+    stable,
+    relevantChangedCount: relevantChanged.length,
+    ignoredChangedCount: diff.changedElements.length - relevantChanged.length,
+    relevantAddedCount: diff.addedCount,
+    relevantRemovedCount: diff.removedCount,
+    diff,
   };
 }

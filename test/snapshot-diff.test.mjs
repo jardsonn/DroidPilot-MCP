@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { compareSnapshots } from "../build/engines/snapshot-diff.js";
+import {
+  compareSnapshots,
+  evaluateSnapshotStability,
+  snapshotFingerprint,
+} from "../build/engines/snapshot-diff.js";
 
 test("compareSnapshots detects screen changes and element additions/removals/updates", () => {
   const before = {
@@ -155,4 +159,90 @@ test("compareSnapshots reports unchanged when the UI is stable", () => {
   assert.equal(diff.changedCount, 0);
   assert.equal(diff.addedCount, 0);
   assert.equal(diff.removedCount, 0);
+});
+
+test("snapshotFingerprint stays stable across ref renumbering", () => {
+  const base = {
+    screen: "com.example.app/.MainActivity",
+    packageName: "com.example.app",
+    timestamp: 1,
+    elements: [
+      {
+        ref: "@e1",
+        type: "TextView",
+        text: "Hello",
+        hint: undefined,
+        contentDesc: undefined,
+        resourceId: "com.example.app:id/title",
+        testTag: "title",
+        bounds: [0, 0, 100, 20],
+        clickable: false,
+        focusable: false,
+        scrollable: false,
+        enabled: true,
+        editable: false,
+        checked: false,
+        selected: false,
+      },
+    ],
+  };
+
+  const renumbered = {
+    ...base,
+    timestamp: 2,
+    elements: [{ ...base.elements[0], ref: "@e9" }],
+  };
+
+  assert.equal(snapshotFingerprint(base), snapshotFingerprint(renumbered));
+});
+
+test("evaluateSnapshotStability ignores text-only churn by default", () => {
+  const before = {
+    screen: "com.example.app/.MainActivity",
+    packageName: "com.example.app",
+    timestamp: 1,
+    elements: [
+      {
+        ref: "@e1",
+        type: "TextView",
+        label: "00:15",
+        text: "00:15",
+        hint: undefined,
+        contentDesc: undefined,
+        resourceId: "com.example.app:id/timer",
+        testTag: "timer",
+        parentText: undefined,
+        childText: undefined,
+        siblingText: undefined,
+        contextText: "00:15",
+        bounds: [0, 0, 80, 20],
+        clickable: false,
+        focusable: false,
+        scrollable: false,
+        enabled: true,
+        editable: false,
+        checked: false,
+        selected: false,
+      },
+    ],
+  };
+
+  const after = {
+    ...before,
+    timestamp: 2,
+    elements: [
+      {
+        ...before.elements[0],
+        label: "00:14",
+        text: "00:14",
+        contextText: "00:14",
+      },
+    ],
+  };
+
+  const stability = evaluateSnapshotStability(before, after);
+
+  assert.equal(stability.stable, true);
+  assert.equal(stability.relevantChangedCount, 0);
+  assert.equal(stability.ignoredChangedCount, 1);
 });

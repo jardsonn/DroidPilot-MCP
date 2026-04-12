@@ -36,8 +36,13 @@ DroidPilot already supports the main local Android feedback loop:
 - accessibility snapshots
 - basic UI interaction
 - selector-based waits and assertions
+- context-rich snapshots for textless clickable elements
 - snapshot diffing between consecutive states
+- deep link opening
+- idle-aware and goal-oriented scrolling helpers
 - screenshot capture
+- per-session artifact capture
+- screen video recording
 - session-aware log collection
 - app health checks with crash baselines
 - environment diagnostics
@@ -68,10 +73,12 @@ With DroidPilot, an agent can:
 5. inspect the current UI in a compact form
 6. wait for elements and assert visible text or screen state
 7. tap buttons and fill fields by ref, selector, or Compose test tag
-8. diff two consecutive snapshots after a navigation
-9. scroll lists, navigate back, and capture screenshots
-10. collect session-aware logs and runtime health information
-11. iterate on code changes using the same local Android loop
+8. use relational selectors such as `nearText` to disambiguate repeated buttons in lists
+9. wait for the UI to become idle after a navigation or async load
+10. scroll until a target appears, open deeplinks, and diff two consecutive snapshots
+11. capture screenshots and videos into a per-session artifact folder
+12. collect session-aware logs and runtime health information
+13. iterate on code changes using the same local Android loop
 
 ---
 
@@ -295,6 +302,7 @@ Arguments:
 - `projectDir: string`
 - `deviceSerial?: string`
 - `preferEmulator?: boolean`
+- `artifactsDir?: string`
 
 ### `doctor`
 
@@ -354,6 +362,19 @@ Returns:
 - warnings
 - summary
 
+### `open_deeplink`
+
+Opens a deeplink or web URI on the current device, optionally targeting the current app package, and can wait for the UI to settle.
+
+Arguments:
+
+- `uri: string`
+- `packageName?: string`
+- `waitForIdle?: boolean`
+- `idleMs?: number`
+- `timeoutMs?: number`
+- `interactiveOnly?: boolean`
+
 ### `snapshot`
 
 Captures the current UI hierarchy and returns compact references such as `@e1`, `@e2`, and so on.
@@ -367,18 +388,29 @@ Returns:
 - current screen/activity
 - current package
 - element count
-- simplified element list
+- simplified element list with best-effort `label`, `parentText`, `childText`, `siblingText`, and `contextText`
 
 Selectors supported across wait/assert/action tools:
 
 - `ref`
 - `resourceId` / `resourceIdContains`
 - `testTag` / `testTagContains`
+- `label` / `labelContains`
 - `text` / `textContains`
 - `contentDesc` / `contentDescContains`
 - `hint` / `hintContains`
+- `parentTextContains`
+- `childTextContains`
+- `siblingTextContains`
+- `contextTextContains`
+- `nearText` / `nearTextContains`
 - `type`
 - boolean flags such as `clickable`, `editable`, `enabled`, `selected`, `checked`
+
+Relational note:
+
+- `nearText` is a disambiguator, not a full selector by itself
+- combine it with a target selector such as `clickable=true`, `textContains`, `resourceId`, or `type`
 
 Compose note:
 
@@ -441,6 +473,33 @@ Arguments:
 - `interactiveOnly?: boolean`
 - `maxItems?: number`
 
+### `wait_for_idle`
+
+Waits until the UI stops changing for a short quiet window.
+
+Arguments:
+
+- `timeoutMs?: number`
+- `idleMs?: number`
+- `pollIntervalMs?: number`
+- `interactiveOnly?: boolean`
+- `ignoreTextualChanges?: boolean`
+- `maxChangedElements?: number`
+- `maxAddedElements?: number`
+- `maxRemovedElements?: number`
+
+### `scroll_until`
+
+Repeatedly scrolls in one direction until an element matching the selector appears or the limit is reached.
+
+Arguments:
+
+- any selector field listed above
+- `direction: "up" | "down" | "left" | "right"`
+- `maxScrolls?: number`
+- `pauseMs?: number`
+- `interactiveOnly?: boolean`
+
 ### `tap`
 
 Taps an element from the latest snapshot or resolves the first match from a semantic selector.
@@ -481,11 +540,29 @@ Presses the Android Back button.
 
 ### `screenshot`
 
-Captures a PNG screenshot from the current device.
+Captures a PNG screenshot from the current device. By default it lands in the current session artifact directory.
 
 Arguments:
 
 - `outputPath?: string`
+
+### `artifacts`
+
+Shows the current session artifact directory and the files already captured there.
+
+### `record_video_start`
+
+Starts device screen recording into the current session artifact directory.
+
+Arguments:
+
+- `outputPath?: string`
+- `bitRateMbps?: number`
+- `timeLimitSec?: number`
+
+### `record_video_stop`
+
+Stops the active screen recording and pulls the MP4 locally.
 
 ### `logs`
 
@@ -602,6 +679,18 @@ Returns app runtime signals:
 }
 ```
 
+### `wait_for_idle`
+
+```json
+{
+  "status": "ok",
+  "waitedMs": 1054,
+  "stableForMs": 941,
+  "screen": "com.example.myapp/.ProfileActivity",
+  "package": "com.example.myapp"
+}
+```
+
 ---
 
 ## Example Agent Prompts
@@ -656,9 +745,13 @@ DroidPilot is designed to be resilient in the places that matter most during loc
 - supports `gradlew.bat` on Windows
 - parses common build failure patterns into structured diagnostics
 - uses a real XML parser for UI snapshots
+- enriches snapshots with sibling/parent/child text context so textless controls are easier to identify
 - supports semantic selectors for waits, assertions, and UI actions
+- supports relational disambiguation with `nearText`
 - supports explicit Compose `testTag` selectors when they are exposed through accessibility / resource IDs
 - tracks log/crash baselines per session and per launch
+- tolerates text-only churn in `wait_for_idle` by default
+- stores snapshots, diffs, screenshots, and videos per session in a predictable artifact folder
 - attempts to resolve the launchable activity instead of assuming `.MainActivity`
 
 That said, DroidPilot still depends on the realities of Android automation:
@@ -759,6 +852,7 @@ src/
   index.ts              MCP server and tool registration
   engines/
     adb.ts              Device discovery, UI inspection, interaction, logs
+    artifacts.ts        Session artifact paths and JSON persistence
     gradle.ts           Project detection, build execution, APK discovery
     selectors.ts        Semantic selector matching for waits, assertions, and actions
     snapshot-diff.ts    UI diffing between consecutive snapshots
@@ -769,6 +863,7 @@ build/
 
 test/
   adb-utils.test.mjs    Log parsing and Compose test tag helper tests
+  artifacts.test.mjs    Artifact path and persistence tests
   gradle.test.mjs       Build engine smoke and regression tests
   selectors.test.mjs    Selector matching regression tests
   snapshot-diff.test.mjs Snapshot diff regression tests
@@ -785,11 +880,15 @@ When working on DroidPilot itself, a useful validation sequence is:
    - `devices`
    - `open`
    - `snapshot`
+   - `wait_for_idle`
 5. then test a real Android app with:
    - `run`
+   - `open_deeplink`
    - `snapshot`
+   - `scroll_until`
    - `snapshot_diff`
    - `tap`
+   - `artifacts`
    - `health`
    - `logs`
 
@@ -797,11 +896,11 @@ When working on DroidPilot itself, a useful validation sequence is:
 
 ## Roadmap
 
-- flow recording and replay
+- reusable capture flows / scriptable screen packs
 - richer Compose semantics and selector support beyond `testTagsAsResourceId`
 - HTTP transport / daemon mode
 - CI integration
-- richer artifact capture
+- richer artifact capture and export bundles
 - multi-session support
 
 ---

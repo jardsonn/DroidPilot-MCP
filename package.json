@@ -1,6 +1,6 @@
 {
   "name": "droidpilot-mcp",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "MCP server for AI agents to build, deploy, and test Android apps",
   "type": "module",
   "main": "build/index.js",
